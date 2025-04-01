@@ -4,10 +4,15 @@ use regex::{Regex, RegexBuilder};
 
 use crate::{types::OwnedValue, LimboError};
 
-pub fn construct_like_escape_arg(escape_value: &OwnedValue) -> Result<char, LimboError> {
+use super::StringPool;
+
+pub fn construct_like_escape_arg(
+    escape_value: &OwnedValue,
+    pool: &StringPool,
+) -> Result<char, LimboError> {
     match escape_value {
         OwnedValue::Text(text) => {
-            let mut escape_chars = text.as_str().chars();
+            let mut escape_chars = text.as_str(pool).chars();
             match (escape_chars.next(), escape_chars.next()) {
                 (Some(escape), None) => Ok(escape),
                 _ => Err(LimboError::Constraint(

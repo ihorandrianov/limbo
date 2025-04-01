@@ -50,16 +50,16 @@ pub fn parse_schema_rows(
             match rows.step()? {
                 StepResult::Row => {
                     let row = rows.row().unwrap();
-                    let ty = row.get::<&str>(0)?;
+                    let ty = row.get::<&str>(0, &mut rows.state.string_pool)?;
                     if !["table", "index"].contains(&ty) {
                         continue;
                     }
                     match ty {
                         "table" => {
-                            let root_page: i64 = row.get::<i64>(3)?;
-                            let sql: &str = row.get::<&str>(4)?;
+                            let root_page: i64 = row.get::<i64>(3, &mut rows.state.string_pool)?;
+                            let sql: &str = row.get::<&str>(4, &mut rows.state.string_pool)?;
                             if root_page == 0 && sql.to_lowercase().contains("virtual") {
-                                let name: &str = row.get::<&str>(1)?;
+                                let name: &str = row.get::<&str>(1, &mut rows.state.string_pool)?;
                                 let vtab = syms.vtabs.get(name).unwrap().clone();
                                 schema.add_virtual_table(vtab);
                             } else {
@@ -68,8 +68,8 @@ pub fn parse_schema_rows(
                             }
                         }
                         "index" => {
-                            let root_page: i64 = row.get::<i64>(3)?;
-                            match row.get::<&str>(4) {
+                            let root_page: i64 = row.get::<i64>(3, &mut rows.state.string_pool)?;
+                            match row.get::<&str>(4, &mut rows.state.string_pool) {
                                 Ok(sql) => {
                                     let index = schema::Index::from_sql(sql, root_page as usize)?;
                                     schema.add_index(Arc::new(index));
@@ -78,9 +78,12 @@ pub fn parse_schema_rows(
                                     // Automatic index on primary key, e.g.
                                     // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
                                     // index|sqlite_autoindex_foo_1|foo|3|
-                                    let index_name = row.get::<&str>(1)?;
-                                    let table_name = row.get::<&str>(2)?;
-                                    let root_page = row.get::<i64>(3)?;
+                                    let index_name =
+                                        row.get::<&str>(1, &mut rows.state.string_pool)?;
+                                    let table_name =
+                                        row.get::<&str>(2, &mut rows.state.string_pool)?;
+                                    let root_page =
+                                        row.get::<i64>(3, &mut rows.state.string_pool)?;
                                     automatic_indexes.push((
                                         index_name.to_string(),
                                         table_name.to_string(),

@@ -76,6 +76,7 @@ use regex::{Regex, RegexBuilder};
 use sorter::Sorter;
 use std::borrow::BorrowMut;
 use std::cell::{Cell, RefCell};
+
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::num::NonZero;
@@ -246,6 +247,365 @@ pub struct Row {
     count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PooledStringRef {
+    tier: StringTier, // Which size tier
+    block_idx: u32,   // Which block in that tier
+    offset: u32,      // Offset within block
+    len: u32,         // String length in bytes
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TierConfig {
+    block_size: usize,
+    blocks: Vec<Box<[u8]>>, // Use dynamically-sized array for different block sizes
+    current_block_idx: usize,
+    current_offset: usize,
+}
+
+impl TierConfig {
+    fn new(block_size: usize) -> Self {
+        Self {
+            block_size,
+            blocks: Vec::with_capacity(4), // Start with space for a few blocks
+            current_block_idx: 0,
+            current_offset: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StringTier {
+    Tiny,
+    Small,
+    Medium,
+    Large,
+    Heap, // For very large strings
+}
+
+impl PartialOrd for StringTier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// Implement Ord for StringTier
+impl Ord for StringTier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Define ordering based on the size each tier represents
+        let self_value = match self {
+            StringTier::Tiny => 0,
+            StringTier::Small => 1,
+            StringTier::Medium => 2,
+            StringTier::Large => 3,
+            StringTier::Heap => 4,
+        };
+
+        let other_value = match other {
+            StringTier::Tiny => 0,
+            StringTier::Small => 1,
+            StringTier::Medium => 2,
+            StringTier::Large => 3,
+            StringTier::Heap => 4,
+        };
+
+        self_value.cmp(&other_value)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum StringValue {
+    Inline { len: u8, data: [u8; 15] },
+    Pooled(PooledStringRef),
+    Heap(Box<str>),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct StringPool {
+    tiers: [TierConfig; 4], // Tiny, Small, Medium, Large
+    heap_strings: Option<Vec<Box<str>>>,
+}
+
+impl StringPool {
+    pub fn new() -> Self {
+        Self {
+            tiers: [
+                TierConfig::new(32),   // Tiny
+                TierConfig::new(128),  // Small
+                TierConfig::new(512),  // Medium
+                TierConfig::new(2048), // Large
+            ],
+            heap_strings: Some(vec![]),
+        }
+    }
+
+    fn tier_index(tier: StringTier) -> usize {
+        match tier {
+            StringTier::Tiny => 0,
+            StringTier::Small => 1,
+            StringTier::Medium => 2,
+            StringTier::Large => 3,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn allocate_in_tier(&mut self, s: &str, tier: StringTier) -> PooledStringRef {
+        let tier_idx = Self::tier_index(tier);
+        let config = &mut self.tiers[tier_idx];
+        let len = s.len();
+
+        // Ensure we have enough space
+        if config.current_offset + len > config.block_size {
+            // Need a new block
+            if config.current_block_idx + 1 >= config.blocks.len() {
+                // Allocate a new block
+                let new_block = vec![0u8; config.block_size].into_boxed_slice();
+                config.blocks.push(new_block);
+            }
+
+            // Move to next block
+            config.current_block_idx += 1;
+            config.current_offset = 0;
+        }
+
+        // Copy string bytes
+        let target = &mut config.blocks[config.current_block_idx]
+            [config.current_offset..config.current_offset + len];
+        target.copy_from_slice(s.as_bytes());
+
+        let string_ref = PooledStringRef {
+            tier,
+            block_idx: config.current_block_idx as u32,
+            offset: config.current_offset as u32,
+            len: len as u32,
+        };
+
+        // Update offset
+        config.current_offset += len;
+
+        string_ref
+    }
+
+    pub fn allocate(&mut self, s: &str) -> PooledStringRef {
+        let len = s.len();
+
+        // Choose appropriate tier based on string length
+        if len <= 15 {
+            // For very small strings, we'd normally use inline storage
+            // But if you want them in the pool too:
+            self.allocate_in_tier(s, StringTier::Tiny)
+        } else if len <= 32 {
+            self.allocate_in_tier(s, StringTier::Tiny)
+        } else if len <= 128 {
+            self.allocate_in_tier(s, StringTier::Small)
+        } else if len <= 512 {
+            self.allocate_in_tier(s, StringTier::Medium)
+        } else if len <= 2048 {
+            self.allocate_in_tier(s, StringTier::Large)
+        } else {
+            // For extremely large strings, use direct heap allocation
+            // for better memory efficiency
+            let boxed_str = Box::from(s);
+
+            // Store in heap storage (you'd need to implement this)
+            let heap_idx = self.store_heap_string(boxed_str);
+
+            PooledStringRef {
+                tier: StringTier::Heap,
+                block_idx: heap_idx, // Use block_idx to store the heap index
+                offset: 0,           // Not used for heap strings
+                len: len as u32,
+            }
+        }
+    }
+
+    // Helper method to store heap strings
+    fn store_heap_string(&mut self, s: Box<str>) -> u32 {
+        // We need a way to store and retrieve heap strings
+        // Here's a simple implementation using a Vec
+        if self.heap_strings.is_none() {
+            self.heap_strings = Some(Vec::with_capacity(16));
+        }
+
+        let idx = self.heap_strings.as_ref().unwrap().len();
+        self.heap_strings.as_mut().unwrap().push(s);
+        idx as u32
+    }
+
+    // Update get_str to handle heap strings
+    pub fn get_str<'a>(&'a self, string_ref: &PooledStringRef) -> &'a str {
+        match string_ref.tier {
+            StringTier::Heap => {
+                if let Some(heap_strings) = &self.heap_strings {
+                    &heap_strings[string_ref.block_idx as usize]
+                } else {
+                    // This should never happen if the code is correct
+                    "[invalid heap string]"
+                }
+            }
+            _ => {
+                // Existing tier-based lookup
+                let tier_idx = Self::tier_index(string_ref.tier);
+                let config = &self.tiers[tier_idx];
+                let block_idx = string_ref.block_idx as usize;
+                let offset = string_ref.offset as usize;
+                let len = string_ref.len as usize;
+
+                let bytes = &config.blocks[block_idx][offset..offset + len];
+                // Safety: we only store valid UTF-8 strings
+                std::str::from_utf8(bytes).unwrap_or("[invalid utf8]")
+            }
+        }
+    }
+
+    pub fn get_string<'a>(&'a self, value: &'a StringValue) -> &'a str {
+        match value {
+            StringValue::Inline { len, data } => {
+                std::str::from_utf8(&data[..*len as usize]).unwrap_or("[invalid utf8]")
+            }
+            StringValue::Pooled(ref_) => self.get_str(ref_),
+            StringValue::Heap(s) => s,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for config in &mut self.tiers {
+            config.current_block_idx = 0;
+            config.current_offset = 0;
+        }
+
+        // Clear heap strings if needed
+        if let Some(heap) = &mut self.heap_strings {
+            heap.clear();
+        }
+    }
+}
+
+impl StringValue {
+    pub fn as_str<'a>(&'a self, pool: &'a StringPool) -> &'a str {
+        match self {
+            StringValue::Inline { len, data } => {
+                std::str::from_utf8(&data[..*len as usize]).unwrap_or("[invalid utf8]")
+            }
+            StringValue::Pooled(ref_) => pool.get_str(ref_),
+            StringValue::Heap(s) => s,
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            StringValue::Inline { len, data } => *len as usize,
+            StringValue::Pooled(ref_) => ref_.len as usize,
+            StringValue::Heap(s) => s.len(),
+        }
+    }
+}
+
+// Implement comparison traits for PooledStringRef first, since it's used within StringValue
+impl PartialEq for PooledStringRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.tier == other.tier
+            && self.block_idx == other.block_idx
+            && self.offset == other.offset
+            && self.len == other.len
+    }
+}
+
+impl Eq for PooledStringRef {}
+
+impl PartialOrd for PooledStringRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PooledStringRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tier
+            .cmp(&other.tier)
+            .then_with(|| self.block_idx.cmp(&other.block_idx))
+            .then_with(|| self.offset.cmp(&other.offset))
+            .then_with(|| self.len.cmp(&other.len))
+    }
+}
+
+// Now implement comparison traits for StringValue
+impl PartialEq for StringValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                StringValue::Inline {
+                    len: len1,
+                    data: data1,
+                },
+                StringValue::Inline {
+                    len: len2,
+                    data: data2,
+                },
+            ) => {
+                if len1 != len2 {
+                    return false;
+                }
+                let s1 = std::str::from_utf8(&data1[..*len1 as usize]).unwrap_or("[invalid utf8]");
+                let s2 = std::str::from_utf8(&data2[..*len2 as usize]).unwrap_or("[invalid utf8]");
+                s1 == s2
+            }
+            (StringValue::Pooled(ref1), StringValue::Pooled(ref2)) => ref1 == ref2,
+            (StringValue::Heap(s1), StringValue::Heap(s2)) => s1 == s2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for StringValue {}
+
+impl PartialOrd for StringValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StringValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        match (self, other) {
+            // Compare Inline variants by their actual string content
+            (
+                StringValue::Inline {
+                    len: len1,
+                    data: data1,
+                },
+                StringValue::Inline {
+                    len: len2,
+                    data: data2,
+                },
+            ) => {
+                let s1 = std::str::from_utf8(&data1[..*len1 as usize]).unwrap_or("[invalid utf8]");
+                let s2 = std::str::from_utf8(&data2[..*len2 as usize]).unwrap_or("[invalid utf8]");
+                s1.cmp(s2)
+            }
+            // Compare Pooled variants by their reference metadata
+            (StringValue::Pooled(ref1), StringValue::Pooled(ref2)) => ref1.cmp(ref2),
+            // Compare Heap variants by their string content
+            (StringValue::Heap(s1), StringValue::Heap(s2)) => s1.cmp(s2),
+            // Define ordering between different variants (arbitrary but consistent)
+            (StringValue::Inline { .. }, _) => Ordering::Less,
+            (_, StringValue::Inline { .. }) => Ordering::Greater,
+            (StringValue::Pooled(_), _) => Ordering::Less,
+            (_, StringValue::Pooled(_)) => Ordering::Greater,
+        }
+    }
+}
+
+// Helper method to compare string content when you have a pool reference
+impl StringValue {
+    pub fn content_cmp<'a>(&'a self, other: &'a Self, pool: &'a StringPool) -> std::cmp::Ordering {
+        let s1 = self.as_str(pool);
+        let s2 = other.as_str(pool);
+        s1.cmp(s2)
+    }
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub pc: InsnReference,
@@ -262,6 +622,7 @@ pub struct ProgramState {
     halt_state: Option<HaltState>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
+    pub string_pool: StringPool,
 }
 
 impl ProgramState {
@@ -282,6 +643,7 @@ impl ProgramState {
             interrupted: false,
             parameters: HashMap::new(),
             halt_state: None,
+            string_pool: StringPool::new(),
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
         }
@@ -324,7 +686,8 @@ impl ProgramState {
         self.interrupted = false;
         self.parameters.clear();
         #[cfg(feature = "json")]
-        self.json_cache.clear()
+        self.json_cache.clear();
+        self.string_pool.reset();
     }
 
     pub fn get_cursor<'a>(&'a self, cursor_id: CursorID) -> std::cell::RefMut<'a, Cursor> {
@@ -336,6 +699,26 @@ impl ProgramState {
                 .expect("cursor not allocated")
         })
     }
+
+    pub fn create_string(&mut self, text: &str) -> OwnedValue {
+        if text.len() <= 15 {
+            // Small strings go inline
+            let mut data = [0u8; 15];
+            let bytes = text.as_bytes();
+            data[..bytes.len()].copy_from_slice(bytes);
+            OwnedValue::Text(StringValue::Inline {
+                len: bytes.len() as u8,
+                data,
+            })
+        } else if text.len() <= 2048 {
+            // Medium strings go in the pool
+            let string_ref = self.string_pool.allocate(text);
+            OwnedValue::Text(StringValue::Pooled(string_ref))
+        } else {
+            // Large strings go on the heap
+            OwnedValue::Text(StringValue::Heap(text.into()))
+        }
+    }
 }
 
 impl Register {
@@ -346,6 +729,8 @@ impl Register {
         }
     }
 }
+
+// Helper to get string representation of any value
 
 macro_rules! must_be_btree_cursor {
     ($cursor_id:expr, $cursor_ref:expr, $state:expr, $insn_name:expr) => {{
@@ -423,6 +808,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_add(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -430,6 +816,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_subtract(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -437,6 +824,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_multiply(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -444,6 +832,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_divide(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -458,6 +847,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_bit_and(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -465,12 +855,15 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_bit_or(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
                 Insn::BitNot { reg, dest } => {
-                    state.registers[*dest] =
-                        Register::OwnedValue(exec_bit_not(state.registers[*reg].get_owned_value()));
+                    state.registers[*dest] = Register::OwnedValue(exec_bit_not(
+                        state.registers[*reg].get_owned_value(),
+                        &state.string_pool,
+                    ));
                     state.pc += 1;
                 }
                 Insn::Checkpoint {
@@ -923,8 +1316,12 @@ impl Program {
                     table_name,
                     args_reg,
                 } => {
-                    let module_name = state.registers[*module_name].get_owned_value().to_string();
-                    let table_name = state.registers[*table_name].get_owned_value().to_string();
+                    let module_name = state.registers[*module_name]
+                        .get_owned_value()
+                        .to_string(&mut state.string_pool);
+                    let table_name = state.registers[*table_name]
+                        .get_owned_value()
+                        .to_string(&mut state.string_pool);
                     let args = if let Some(args_reg) = args_reg {
                         if let Register::Record(rec) = &state.registers[*args_reg] {
                             rec.get_values().iter().map(|v| v.to_ffi()).collect()
@@ -977,7 +1374,7 @@ impl Program {
                         for i in 0..*arg_count {
                             args.push(state.registers[args_reg + i].get_owned_value().clone());
                         }
-                        virtual_table.filter(cursor, *arg_count, args)?
+                        virtual_table.filter(cursor, *arg_count, args, &mut state.string_pool)?
                     };
                     if !has_rows {
                         state.pc = pc_if_empty.to_offset_int();
@@ -997,7 +1394,7 @@ impl Program {
                     let value = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_virtual_mut();
-                        virtual_table.column(cursor, *column)?
+                        virtual_table.column(cursor, *column, &mut state.string_pool)?
                     };
                     state.registers[*dest] = Register::OwnedValue(value);
                     state.pc += 1;
@@ -1031,7 +1428,7 @@ impl Program {
                             )));
                         }
                     }
-                    let result = virtual_table.update(&argv);
+                    let result = virtual_table.update(&argv, &mut state.string_pool);
                     match result {
                         Ok(Some(new_rowid)) => {
                             if *conflict_action == 5 {
@@ -1204,10 +1601,11 @@ impl Program {
                             match (&value, &mut state.registers[*dest]) {
                                 (
                                     RefValue::Text(text_ref),
-                                    Register::OwnedValue(OwnedValue::Text(text_reg)),
+                                    Register::OwnedValue(OwnedValue::Text(val)),
                                 ) => {
-                                    text_reg.value.clear();
-                                    text_reg.value.extend_from_slice(text_ref.value.to_slice());
+                                    state.registers[*dest] = Register::OwnedValue(
+                                        state.create_string(text_ref.as_str()),
+                                    );
                                 }
                                 (
                                     RefValue::Blob(raw_slice),
@@ -1261,7 +1659,8 @@ impl Program {
                     count,
                     dest_reg,
                 } => {
-                    let record = make_record(&state.registers, start_reg, count);
+                    let record =
+                        make_record(&state.registers, start_reg, count, &mut state.string_pool);
                     state.registers[*dest_reg] = Register::Record(record);
                     state.pc += 1;
                 }
@@ -1466,7 +1865,8 @@ impl Program {
                     state.pc += 1;
                 }
                 Insn::String8 { value, dest } => {
-                    state.registers[*dest] = Register::OwnedValue(OwnedValue::build_text(value));
+                    state.registers[*dest] =
+                        Register::OwnedValue(OwnedValue::build_text(value, &mut state.string_pool));
                     state.pc += 1;
                 }
                 Insn::Blob { value, dest } => {
@@ -1541,7 +1941,7 @@ impl Program {
                             OwnedValue::Null => None,
                             other => {
                                 return Err(LimboError::InternalError(
-                                    format!("SeekRowid: the value in the register is not an integer or NULL: {}", other)
+                                    format!("SeekRowid: the value in the register is not an integer or NULL: {}", other.to_string(&state.string_pool))
                                 ));
                             }
                         };
@@ -1580,8 +1980,12 @@ impl Program {
                         let found = {
                             let mut cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_btree_mut();
-                            let record_from_regs =
-                                make_record(&state.registers, start_reg, num_regs);
+                            let record_from_regs = make_record(
+                                &state.registers,
+                                start_reg,
+                                num_regs,
+                                &mut state.string_pool,
+                            );
                             let found = return_if_io!(
                                 cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GE)
                             );
@@ -1639,8 +2043,12 @@ impl Program {
                         let found = {
                             let mut cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_btree_mut();
-                            let record_from_regs =
-                                make_record(&state.registers, start_reg, num_regs);
+                            let record_from_regs = make_record(
+                                &state.registers,
+                                start_reg,
+                                num_regs,
+                                &mut state.string_pool,
+                            );
                             let found = return_if_io!(
                                 cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GT)
                             );
@@ -1697,7 +2105,12 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(
+                            &state.registers,
+                            start_reg,
+                            num_regs,
+                            &mut state.string_pool,
+                        );
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             let ord = compare_immutable(
@@ -1726,7 +2139,12 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(
+                            &state.registers,
+                            start_reg,
+                            num_regs,
+                            &mut state.string_pool,
+                        );
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -1755,7 +2173,12 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(
+                            &state.registers,
+                            start_reg,
+                            num_regs,
+                            &mut state.string_pool,
+                        );
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -1784,7 +2207,12 @@ impl Program {
                     let pc = {
                         let mut cursor = state.get_cursor(*cursor_id);
                         let cursor = cursor.as_btree_mut();
-                        let record_from_regs = make_record(&state.registers, start_reg, num_regs);
+                        let record_from_regs = make_record(
+                            &state.registers,
+                            start_reg,
+                            num_regs,
+                            &mut state.string_pool,
+                        );
                         let pc = if let Some(ref idx_record) = *cursor.record() {
                             // Compare against the same number of values
                             if idx_record.get_values()[..record_from_regs.len()]
@@ -1875,9 +2303,11 @@ impl Program {
                                     }
                                 }
                             }
-                            AggFunc::GroupConcat | AggFunc::StringAgg => Register::Aggregate(
-                                AggContext::GroupConcat(OwnedValue::build_text("")),
-                            ),
+                            AggFunc::GroupConcat | AggFunc::StringAgg => {
+                                Register::Aggregate(AggContext::GroupConcat(
+                                    OwnedValue::build_text("", &mut state.string_pool),
+                                ))
+                            }
                             AggFunc::External(func) => match func.as_ref() {
                                 ExtFunc::Aggregate {
                                     init,
@@ -1905,8 +2335,8 @@ impl Program {
                             let AggContext::Avg(acc, count) = agg.borrow_mut() else {
                                 unreachable!();
                             };
-                            *acc = exec_add(acc, col.get_owned_value());
-                            *count += 1;
+                            *acc = exec_add(acc, col.get_owned_value(), &state.string_pool);
+                            *count = count.add(OwnedValue::Integer(1), &mut state.string_pool);
                         }
                         AggFunc::Sum | AggFunc::Total => {
                             let col = state.registers[*col].clone();
@@ -1919,7 +2349,7 @@ impl Program {
                             };
                             match col {
                                 Register::OwnedValue(owned_value) => {
-                                    *acc += owned_value;
+                                    *acc = acc.add(owned_value, &mut state.string_pool);
                                 }
                                 _ => unreachable!(),
                             }
@@ -1943,7 +2373,7 @@ impl Program {
 
                             if !(matches!(func, AggFunc::Count) && matches!(col, OwnedValue::Null))
                             {
-                                *count += 1;
+                                *count = count.add(OwnedValue::Integer(1), &mut state.string_pool);
                             };
                         }
                         AggFunc::Max => {
@@ -1980,7 +2410,7 @@ impl Program {
                                     Some(OwnedValue::Text(ref mut current_max)),
                                     OwnedValue::Text(value),
                                 ) => {
-                                    if value.value > current_max.value {
+                                    if value > current_max {
                                         *current_max = value.clone();
                                     }
                                 }
@@ -2023,7 +2453,7 @@ impl Program {
                                     Some(OwnedValue::Text(ref mut current_min)),
                                     OwnedValue::Text(text),
                                 ) => {
-                                    if text.value < current_min.value {
+                                    if text < current_min {
                                         *current_min = text.clone();
                                     }
                                 }
@@ -2042,16 +2472,16 @@ impl Program {
                             let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
                                 unreachable!();
                             };
-                            if acc.to_string().is_empty() {
+                            if acc.to_string(&mut state.string_pool).is_empty() {
                                 *acc = col;
                             } else {
                                 match delimiter {
                                     Register::OwnedValue(owned_value) => {
-                                        *acc += owned_value;
+                                        *acc = acc.add(owned_value, &mut state.string_pool);
                                     }
                                     _ => unreachable!(),
                                 }
-                                *acc += col;
+                                *acc = acc.add(col, &mut state.string_pool);
                             }
                         }
                         AggFunc::External(_) => {
@@ -2070,7 +2500,8 @@ impl Program {
                                 let register_slice = &state.registers[*col..*col + argc];
                                 let mut ext_values: Vec<ExtValue> = Vec::with_capacity(argc);
                                 for ov in register_slice.iter() {
-                                    ext_values.push(ov.get_owned_value().to_ffi());
+                                    ext_values
+                                        .push(ov.get_owned_value().to_ffi(&mut state.string_pool));
                                 }
                                 let argv_ptr = ext_values.as_ptr();
                                 unsafe { step_fn(state_ptr, argc as i32, argv_ptr) };
@@ -2146,7 +2577,7 @@ impl Program {
                                 state.registers[*register] = Register::OwnedValue(acc.clone());
                             }
                             AggFunc::External(_) => {
-                                agg.compute_external()?;
+                                agg.compute_external(&mut state.string_pool)?;
                                 let AggContext::External(agg_state) = agg.borrow_mut() else {
                                     unreachable!();
                                 };
@@ -2513,7 +2944,7 @@ impl Program {
                                 // To the way blobs are parsed here in SQLite.
                                 let indent = match indent {
                                     Some(value) => match value.get_owned_value() {
-                                        OwnedValue::Text(text) => text.as_str(),
+                                        OwnedValue::Text(text) => text.as_str(&state.string_pool),
                                         OwnedValue::Integer(val) => &val.to_string(),
                                         OwnedValue::Float(val) => &val.to_string(),
                                         OwnedValue::Blob(val) => &String::from_utf8_lossy(val),
@@ -2566,7 +2997,8 @@ impl Program {
                                 };
                                 let result = exec_cast(
                                     &reg_value_argument.get_owned_value(),
-                                    reg_value_type.as_str(),
+                                    reg_value_type.as_str(&state.string_pool),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2579,20 +3011,23 @@ impl Program {
                             ScalarFunc::Char => {
                                 let reg_values =
                                     &state.registers[*start_reg..*start_reg + arg_count];
-                                state.registers[*dest] =
-                                    Register::OwnedValue(exec_char(reg_values));
+                                state.registers[*dest] = Register::OwnedValue(exec_char(
+                                    reg_values,
+                                    &mut state.string_pool,
+                                ));
                             }
                             ScalarFunc::Coalesce => {}
                             ScalarFunc::Concat => {
                                 let reg_values =
                                     &state.registers[*start_reg..*start_reg + arg_count];
-                                let result = exec_concat_strings(reg_values);
+                                let result =
+                                    exec_concat_strings(reg_values, &mut state.string_pool);
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             ScalarFunc::ConcatWs => {
                                 let reg_values =
                                     &state.registers[*start_reg..*start_reg + arg_count];
-                                let result = exec_concat_ws(reg_values);
+                                let result = exec_concat_ws(reg_values, &mut state.string_pool);
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             ScalarFunc::Glob => {
@@ -2608,8 +3043,8 @@ impl Program {
                                             };
                                             OwnedValue::Integer(exec_glob(
                                                 cache,
-                                                pattern.as_str(),
-                                                text.as_str(),
+                                                pattern.as_str(&state.string_pool),
+                                                text.as_str(&state.string_pool),
                                             )
                                                 as i64)
                                         }
@@ -2627,6 +3062,7 @@ impl Program {
                                 let result = exec_instr(
                                     reg_value.get_owned_value(),
                                     pattern_value.get_owned_value(),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2645,11 +3081,19 @@ impl Program {
 
                                 let pattern = match pattern.get_owned_value() {
                                     OwnedValue::Text(_) => pattern.get_owned_value(),
-                                    _ => &exec_cast(pattern.get_owned_value(), "TEXT"),
+                                    _ => &exec_cast(
+                                        pattern.get_owned_value(),
+                                        "TEXT",
+                                        &mut state.string_pool,
+                                    ),
                                 };
                                 let match_expression = match match_expression.get_owned_value() {
                                     OwnedValue::Text(_) => match_expression.get_owned_value(),
-                                    _ => &exec_cast(match_expression.get_owned_value(), "TEXT"),
+                                    _ => &exec_cast(
+                                        match_expression.get_owned_value(),
+                                        "TEXT",
+                                        &mut state.string_pool,
+                                    ),
                                 };
 
                                 let result = match (pattern, match_expression) {
@@ -2659,14 +3103,15 @@ impl Program {
                                     ) if arg_count == 3 => {
                                         let escape = match construct_like_escape_arg(
                                             state.registers[*start_reg + 2].get_owned_value(),
+                                            &state.string_pool,
                                         ) {
                                             Ok(x) => x,
                                             Err(e) => return Err(e),
                                         };
 
                                         OwnedValue::Integer(exec_like_with_escape(
-                                            pattern.as_str(),
-                                            match_expression.as_str(),
+                                            pattern.as_str(&state.string_pool),
+                                            match_expression.as_str(&state.string_pool),
                                             escape,
                                         )
                                             as i64)
@@ -2682,8 +3127,8 @@ impl Program {
                                         };
                                         OwnedValue::Integer(exec_like(
                                             cache,
-                                            pattern.as_str(),
-                                            match_expression.as_str(),
+                                            pattern.as_str(&state.string_pool),
+                                            match_expression.as_str(&state.string_pool),
                                         )
                                             as i64)
                                     }
@@ -2712,18 +3157,38 @@ impl Program {
                                 let reg_value =
                                     state.registers[*start_reg].borrow_mut().get_owned_value();
                                 let result = match scalar_func {
-                                    ScalarFunc::Sign => exec_sign(reg_value),
+                                    ScalarFunc::Sign => exec_sign(reg_value, &state.string_pool),
                                     ScalarFunc::Abs => Some(exec_abs(reg_value)?),
-                                    ScalarFunc::Lower => exec_lower(reg_value),
-                                    ScalarFunc::Upper => exec_upper(reg_value),
-                                    ScalarFunc::Length => Some(exec_length(reg_value)),
-                                    ScalarFunc::OctetLength => Some(exec_octet_length(reg_value)),
-                                    ScalarFunc::Typeof => Some(exec_typeof(reg_value)),
-                                    ScalarFunc::Unicode => Some(exec_unicode(reg_value)),
-                                    ScalarFunc::Quote => Some(exec_quote(reg_value)),
-                                    ScalarFunc::RandomBlob => Some(exec_randomblob(reg_value)),
-                                    ScalarFunc::ZeroBlob => Some(exec_zeroblob(reg_value)),
-                                    ScalarFunc::Soundex => Some(exec_soundex(reg_value)),
+                                    ScalarFunc::Lower => {
+                                        exec_lower(reg_value, &mut state.string_pool)
+                                    }
+                                    ScalarFunc::Upper => {
+                                        exec_upper(reg_value, &mut state.string_pool)
+                                    }
+                                    ScalarFunc::Length => {
+                                        Some(exec_length(reg_value, &mut state.string_pool))
+                                    }
+                                    ScalarFunc::OctetLength => {
+                                        Some(exec_octet_length(reg_value, &mut state.string_pool))
+                                    }
+                                    ScalarFunc::Typeof => {
+                                        Some(exec_typeof(reg_value, &mut state.string_pool))
+                                    }
+                                    ScalarFunc::Unicode => {
+                                        Some(exec_unicode(reg_value, &mut state.string_pool))
+                                    }
+                                    ScalarFunc::Quote => {
+                                        Some(exec_quote(reg_value, &mut state.string_pool))
+                                    }
+                                    ScalarFunc::RandomBlob => {
+                                        Some(exec_randomblob(reg_value, &state.string_pool))
+                                    }
+                                    ScalarFunc::ZeroBlob => {
+                                        Some(exec_zeroblob(reg_value, &mut state.string_pool))
+                                    }
+                                    ScalarFunc::Soundex => {
+                                        Some(exec_soundex(reg_value, &mut state.string_pool))
+                                    }
                                     _ => unreachable!(),
                                 };
                                 state.registers[*dest] =
@@ -2731,7 +3196,8 @@ impl Program {
                             }
                             ScalarFunc::Hex => {
                                 let reg_value = state.registers[*start_reg].borrow_mut();
-                                let result = exec_hex(reg_value.get_owned_value());
+                                let result =
+                                    exec_hex(reg_value.get_owned_value(), &mut state.string_pool);
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             ScalarFunc::Unhex => {
@@ -2740,6 +3206,7 @@ impl Program {
                                 let result = exec_unhex(
                                     reg_value.get_owned_value(),
                                     ignored_chars.map(|x| x.get_owned_value()),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2756,6 +3223,7 @@ impl Program {
                                 let result = exec_trim(
                                     reg_value.get_owned_value(),
                                     pattern_value.map(|x| x.get_owned_value()),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2769,6 +3237,7 @@ impl Program {
                                 let result = exec_ltrim(
                                     reg_value.get_owned_value(),
                                     pattern_value.map(|x| x.get_owned_value()),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2782,6 +3251,7 @@ impl Program {
                                 let result = exec_rtrim(
                                     &reg_value.get_owned_value(),
                                     pattern_value.map(|x| x.get_owned_value()),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2796,6 +3266,7 @@ impl Program {
                                 let result = exec_round(
                                     reg_value.get_owned_value(),
                                     precision_value.map(|x| x.get_owned_value()),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2829,6 +3300,7 @@ impl Program {
                                     str_value.get_owned_value(),
                                     start_value.get_owned_value(),
                                     length_value.map(|x| x.get_owned_value()),
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2856,10 +3328,12 @@ impl Program {
                             }
                             ScalarFunc::JulianDay => {
                                 if *start_reg == 0 {
-                                    let julianday: String =
-                                        exec_julianday(&OwnedValue::build_text("now"))?;
-                                    state.registers[*dest] =
-                                        Register::OwnedValue(OwnedValue::build_text(&julianday));
+                                    let julianday: String = exec_julianday(
+                                        &OwnedValue::build_text("now", &mut state.string_pool),
+                                    )?;
+                                    state.registers[*dest] = Register::OwnedValue(
+                                        OwnedValue::build_text(&julianday, &mut state.string_pool),
+                                    );
                                 } else {
                                     let datetime_value = &state.registers[*start_reg];
                                     let julianday =
@@ -2867,7 +3341,10 @@ impl Program {
                                     match julianday {
                                         Ok(time) => {
                                             state.registers[*dest] =
-                                                Register::OwnedValue(OwnedValue::build_text(&time))
+                                                Register::OwnedValue(OwnedValue::build_text(
+                                                    &time,
+                                                    &mut state.string_pool,
+                                                ))
                                         }
                                         Err(e) => {
                                             return Err(LimboError::ParseError(format!(
@@ -2880,10 +3357,12 @@ impl Program {
                             }
                             ScalarFunc::UnixEpoch => {
                                 if *start_reg == 0 {
-                                    let unixepoch: String =
-                                        exec_unixepoch(&OwnedValue::build_text("now"))?;
-                                    state.registers[*dest] =
-                                        Register::OwnedValue(OwnedValue::build_text(&unixepoch));
+                                    let unixepoch: String = exec_unixepoch(
+                                        &OwnedValue::build_text("now", &mut state.string_pool),
+                                    )?;
+                                    state.registers[*dest] = Register::OwnedValue(
+                                        OwnedValue::build_text(&unixepoch, &mut state.string_pool),
+                                    );
                                 } else {
                                     let datetime_value = &state.registers[*start_reg];
                                     let unixepoch =
@@ -2891,7 +3370,10 @@ impl Program {
                                     match unixepoch {
                                         Ok(time) => {
                                             state.registers[*dest] =
-                                                Register::OwnedValue(OwnedValue::build_text(&time))
+                                                Register::OwnedValue(OwnedValue::build_text(
+                                                    &time,
+                                                    &mut state.string_pool,
+                                                ))
                                         }
                                         Err(e) => {
                                             return Err(LimboError::ParseError(format!(
@@ -2906,8 +3388,9 @@ impl Program {
                                 let version_integer: i64 =
                                     DATABASE_VERSION.get().unwrap().parse()?;
                                 let version = execute_sqlite_version(version_integer);
-                                state.registers[*dest] =
-                                    Register::OwnedValue(OwnedValue::build_text(&version));
+                                state.registers[*dest] = Register::OwnedValue(
+                                    OwnedValue::build_text(&version, &mut state.string_pool),
+                                );
                             }
                             ScalarFunc::SqliteSourceId => {
                                 let src_id = format!(
@@ -2915,8 +3398,9 @@ impl Program {
                                     info::build::BUILT_TIME_SQLITE,
                                     info::build::GIT_COMMIT_HASH.unwrap_or("unknown")
                                 );
-                                state.registers[*dest] =
-                                    Register::OwnedValue(OwnedValue::build_text(&src_id));
+                                state.registers[*dest] = Register::OwnedValue(
+                                    OwnedValue::build_text(&src_id, &mut state.string_pool),
+                                );
                             }
                             ScalarFunc::Replace => {
                                 assert_eq!(arg_count, 3);
@@ -2927,13 +3411,17 @@ impl Program {
                                     source.get_owned_value(),
                                     pattern.get_owned_value(),
                                     replacement.get_owned_value(),
+                                    &mut state.string_pool,
                                 ));
                             }
                             #[cfg(feature = "fs")]
                             ScalarFunc::LoadExtension => {
                                 let extension = &state.registers[*start_reg];
-                                let ext =
-                                    resolve_ext_path(&extension.get_owned_value().to_string())?;
+                                let ext = resolve_ext_path(
+                                    &extension
+                                        .get_owned_value()
+                                        .to_string(&mut state.string_pool),
+                                )?;
                                 if let Some(conn) = self.connection.upgrade() {
                                     conn.load_extension(ext)?;
                                 }
@@ -2953,29 +3441,37 @@ impl Program {
                         },
                         crate::function::Func::Vector(vector_func) => match vector_func {
                             VectorFunc::Vector => {
-                                let result =
-                                    vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
+                                let result = vector32(
+                                    &state.registers[*start_reg..*start_reg + arg_count],
+                                    &mut state.string_pool,
+                                )?;
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             VectorFunc::Vector32 => {
-                                let result =
-                                    vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
+                                let result = vector32(
+                                    &state.registers[*start_reg..*start_reg + arg_count],
+                                    &mut state.string_pool,
+                                )?;
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             VectorFunc::Vector64 => {
-                                let result =
-                                    vector64(&state.registers[*start_reg..*start_reg + arg_count])?;
+                                let result = vector64(
+                                    &state.registers[*start_reg..*start_reg + arg_count],
+                                    &mut state.string_pool,
+                                )?;
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             VectorFunc::VectorExtract => {
                                 let result = vector_extract(
                                     &state.registers[*start_reg..*start_reg + arg_count],
+                                    &mut state.string_pool,
                                 )?;
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
                             VectorFunc::VectorDistanceCos => {
                                 let result = vector_distance_cos(
                                     &state.registers[*start_reg..*start_reg + arg_count],
+                                    &mut state.string_pool,
                                 )?;
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -2985,7 +3481,10 @@ impl Program {
                                 if arg_count == 0 {
                                     let result_c_value: ExtValue =
                                         unsafe { (f)(0, std::ptr::null()) };
-                                    match OwnedValue::from_ffi(result_c_value) {
+                                    match OwnedValue::from_ffi(
+                                        result_c_value,
+                                        &mut state.string_pool,
+                                    ) {
                                         Ok(result_ov) => {
                                             state.registers[*dest] =
                                                 Register::OwnedValue(result_ov);
@@ -3000,13 +3499,17 @@ impl Program {
                                     let mut ext_values: Vec<ExtValue> =
                                         Vec::with_capacity(arg_count);
                                     for ov in register_slice.iter() {
-                                        let val = ov.get_owned_value().to_ffi();
+                                        let val =
+                                            ov.get_owned_value().to_ffi(&mut state.string_pool);
                                         ext_values.push(val);
                                     }
                                     let argv_ptr = ext_values.as_ptr();
                                     let result_c_value: ExtValue =
                                         unsafe { (f)(arg_count as i32, argv_ptr) };
-                                    match OwnedValue::from_ffi(result_c_value) {
+                                    match OwnedValue::from_ffi(
+                                        result_c_value,
+                                        &mut state.string_pool,
+                                    ) {
                                         Ok(result_ov) => {
                                             state.registers[*dest] =
                                                 Register::OwnedValue(result_ov);
@@ -3036,8 +3539,11 @@ impl Program {
 
                             MathFuncArity::Unary => {
                                 let reg_value = &state.registers[*start_reg];
-                                let result =
-                                    exec_math_unary(reg_value.get_owned_value(), math_func);
+                                let result = exec_math_unary(
+                                    reg_value.get_owned_value(),
+                                    math_func,
+                                    &mut state.string_pool,
+                                );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
 
@@ -3048,6 +3554,7 @@ impl Program {
                                     lhs.get_owned_value(),
                                     rhs.get_owned_value(),
                                     math_func,
+                                    &mut state.string_pool,
                                 );
                                 state.registers[*dest] = Register::OwnedValue(result);
                             }
@@ -3057,7 +3564,11 @@ impl Program {
                                     let result = match arg_count {
                                         1 => {
                                             let arg = &state.registers[*start_reg];
-                                            exec_math_log(arg.get_owned_value(), None)
+                                            exec_math_log(
+                                                arg.get_owned_value(),
+                                                None,
+                                                &mut state.string_pool,
+                                            )
                                         }
                                         2 => {
                                             let base = &state.registers[*start_reg];
@@ -3065,6 +3576,7 @@ impl Program {
                                             exec_math_log(
                                                 arg.get_owned_value(),
                                                 Some(base.get_owned_value()),
+                                                &mut state.string_pool,
                                             )
                                         }
                                         _ => unreachable!(
@@ -3221,7 +3733,7 @@ impl Program {
                             ),
                         },
                         OwnedValue::Text(text) => {
-                            match checked_cast_text_to_numeric(text.as_str()) {
+                            match checked_cast_text_to_numeric(text.as_str(&state.string_pool)) {
                                 Ok(OwnedValue::Integer(i)) => {
                                     state.registers[*reg] =
                                         Register::OwnedValue(OwnedValue::Integer(i))
@@ -3453,6 +3965,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_shift_right(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -3460,6 +3973,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_shift_left(
                         state.registers[*lhs].get_owned_value(),
                         state.registers[*rhs].get_owned_value(),
+                        &state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -3485,6 +3999,7 @@ impl Program {
                 Insn::Not { reg, dest } => {
                     state.registers[*dest] = Register::OwnedValue(exec_boolean_not(
                         state.registers[*reg].get_owned_value(),
+                        &mut state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -3492,6 +4007,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_concat(
                         &state.registers[*lhs].get_owned_value(),
                         &state.registers[*rhs].get_owned_value(),
+                        &mut state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -3499,6 +4015,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_and(
                         &state.registers[*lhs].get_owned_value(),
                         &state.registers[*rhs].get_owned_value(),
+                        &mut state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -3506,6 +4023,7 @@ impl Program {
                     state.registers[*dest] = Register::OwnedValue(exec_or(
                         &state.registers[*lhs].get_owned_value(),
                         &state.registers[*rhs].get_owned_value(),
+                        &mut state.string_pool,
                     ));
                     state.pc += 1;
                 }
@@ -3636,8 +4154,13 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
     Ok(CursorResult::Ok(rowid.try_into().unwrap()))
 }
 
-fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
-    ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count])
+fn make_record(
+    registers: &[Register],
+    start_reg: &usize,
+    count: &usize,
+    pool: &mut StringPool,
+) -> ImmutableRecord {
+    ImmutableRecord::from_registers(&registers[*start_reg..*start_reg + *count], pool)
 }
 
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
@@ -3695,60 +4218,60 @@ fn get_indent_count(indent_count: usize, curr_insn: &Insn, prev_insn: Option<&In
     }
 }
 
-fn exec_lower(reg: &OwnedValue) -> Option<OwnedValue> {
+fn exec_lower(reg: &OwnedValue, pool: &mut StringPool) -> Option<OwnedValue> {
     match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str().to_lowercase())),
+        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str(pool).to_lowercase(), pool)),
         t => Some(t.to_owned()),
     }
 }
 
-fn exec_length(reg: &OwnedValue) -> OwnedValue {
+fn exec_length(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match reg {
         OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-            OwnedValue::Integer(reg.to_string().chars().count() as i64)
+            OwnedValue::Integer(reg.to_string(pool).chars().count() as i64)
         }
         OwnedValue::Blob(blob) => OwnedValue::Integer(blob.len() as i64),
         _ => reg.to_owned(),
     }
 }
 
-fn exec_octet_length(reg: &OwnedValue) -> OwnedValue {
+fn exec_octet_length(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match reg {
         OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-            OwnedValue::Integer(reg.to_string().into_bytes().len() as i64)
+            OwnedValue::Integer(reg.to_string(pool).into_bytes().len() as i64)
         }
         OwnedValue::Blob(blob) => OwnedValue::Integer(blob.len() as i64),
         _ => reg.to_owned(),
     }
 }
 
-fn exec_upper(reg: &OwnedValue) -> Option<OwnedValue> {
+fn exec_upper(reg: &OwnedValue, pool: &mut StringPool) -> Option<OwnedValue> {
     match reg {
-        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str().to_uppercase())),
+        OwnedValue::Text(t) => Some(OwnedValue::build_text(&t.as_str(pool).to_uppercase(), pool)),
         t => Some(t.to_owned()),
     }
 }
 
-fn exec_concat_strings(registers: &[Register]) -> OwnedValue {
+fn exec_concat_strings(registers: &[Register], pool: &mut StringPool) -> OwnedValue {
     let mut result = String::new();
     for reg in registers {
         match reg.get_owned_value() {
             OwnedValue::Null => continue,
             OwnedValue::Blob(_) => todo!("TODO concat blob"),
-            v => result.push_str(&format!("{}", v)),
+            v => result.push_str(&v.to_string(pool)),
         }
     }
-    OwnedValue::build_text(&result)
+    OwnedValue::build_text(&result, pool)
 }
 
-fn exec_concat_ws(registers: &[Register]) -> OwnedValue {
+fn exec_concat_ws(registers: &[Register], pool: &mut StringPool) -> OwnedValue {
     if registers.is_empty() {
         return OwnedValue::Null;
     }
 
     let separator = match &registers[0].get_owned_value() {
         OwnedValue::Null | OwnedValue::Blob(_) => return OwnedValue::Null,
-        v => format!("{}", v),
+        v => v.to_string(pool),
     };
 
     let mut result = String::new();
@@ -3762,23 +4285,23 @@ fn exec_concat_ws(registers: &[Register]) -> OwnedValue {
                 OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_)
             ) =>
             {
-                result.push_str(&format!("{}", v))
+                result.push_str(&v.to_string(pool))
             }
             _ => continue,
         }
     }
 
-    OwnedValue::build_text(&result)
+    OwnedValue::build_text(&result, pool)
 }
 
-fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
+fn exec_sign(reg: &OwnedValue, pool: &StringPool) -> Option<OwnedValue> {
     let num = match reg {
         OwnedValue::Integer(i) => *i as f64,
         OwnedValue::Float(f) => *f,
         OwnedValue::Text(s) => {
-            if let Ok(i) = s.as_str().parse::<i64>() {
+            if let Ok(i) = s.as_str(pool).parse::<i64>() {
                 i as f64
-            } else if let Ok(f) = s.as_str().parse::<f64>() {
+            } else if let Ok(f) = s.as_str(pool).parse::<f64>() {
                 f
             } else {
                 return Some(OwnedValue::Null);
@@ -3811,28 +4334,28 @@ fn exec_sign(reg: &OwnedValue) -> Option<OwnedValue> {
 }
 
 /// Generates the Soundex code for a given word
-pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
+pub fn exec_soundex(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     let s = match reg {
-        OwnedValue::Null => return OwnedValue::build_text("?000"),
+        OwnedValue::Null => return OwnedValue::build_text("?000", pool),
         OwnedValue::Text(s) => {
             // return ?000 if non ASCII alphabet character is found
-            if !s.as_str().chars().all(|c| c.is_ascii_alphabetic()) {
-                return OwnedValue::build_text("?000");
+            if !s.as_str(pool).chars().all(|c| c.is_ascii_alphabetic()) {
+                return OwnedValue::build_text("?000", pool);
             }
             s.clone()
         }
-        _ => return OwnedValue::build_text("?000"), // For unsupported types, return NULL
+        _ => return OwnedValue::build_text("?000", pool), // For unsupported types, return NULL
     };
 
     // Remove numbers and spaces
     let word: String = s
-        .as_str()
+        .as_str(pool)
         .chars()
         .filter(|c| !c.is_ascii_digit())
         .collect::<String>()
         .replace(" ", "");
     if word.is_empty() {
-        return OwnedValue::build_text("0000");
+        return OwnedValue::build_text("0000", pool);
     }
 
     let soundex_code = |c| match c {
@@ -3898,7 +4421,7 @@ pub fn exec_soundex(reg: &OwnedValue) -> OwnedValue {
 
     // Retain the first 4 characters and convert to uppercase
     result.truncate(4);
-    OwnedValue::build_text(&result.to_uppercase())
+    OwnedValue::build_text(&result.to_uppercase(), pool)
 }
 
 fn exec_abs(reg: &OwnedValue) -> Result<OwnedValue> {
@@ -3930,11 +4453,11 @@ fn exec_random() -> OwnedValue {
     OwnedValue::Integer(random_number)
 }
 
-fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
+fn exec_randomblob(reg: &OwnedValue, pool: &StringPool) -> OwnedValue {
     let length = match reg {
         OwnedValue::Integer(i) => *i,
         OwnedValue::Float(f) => *f as i64,
-        OwnedValue::Text(t) => t.as_str().parse().unwrap_or(1),
+        OwnedValue::Text(t) => t.as_str(pool).parse().unwrap_or(1),
         _ => 1,
     }
     .max(1) as usize;
@@ -3944,15 +4467,15 @@ fn exec_randomblob(reg: &OwnedValue) -> OwnedValue {
     OwnedValue::Blob(blob)
 }
 
-fn exec_quote(value: &OwnedValue) -> OwnedValue {
+fn exec_quote(value: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match value {
-        OwnedValue::Null => OwnedValue::build_text("NULL"),
+        OwnedValue::Null => OwnedValue::build_text("NULL", pool),
         OwnedValue::Integer(_) | OwnedValue::Float(_) => value.to_owned(),
         OwnedValue::Blob(_) => todo!(),
         OwnedValue::Text(s) => {
-            let mut quoted = String::with_capacity(s.as_str().len() + 2);
+            let mut quoted = String::with_capacity(s.as_str(pool).len() + 2);
             quoted.push('\'');
-            for c in s.as_str().chars() {
+            for c in s.as_str(pool).chars() {
                 if c == '\0' {
                     break;
                 } else if c == '\'' {
@@ -3963,12 +4486,12 @@ fn exec_quote(value: &OwnedValue) -> OwnedValue {
                 }
             }
             quoted.push('\'');
-            OwnedValue::build_text(&quoted)
+            OwnedValue::build_text(&quoted, pool)
         }
     }
 }
 
-fn exec_char(values: &[Register]) -> OwnedValue {
+fn exec_char(values: &[Register], pool: &mut StringPool) -> OwnedValue {
     let result: String = values
         .iter()
         .filter_map(|x| {
@@ -3979,7 +4502,7 @@ fn exec_char(values: &[Register]) -> OwnedValue {
             }
         })
         .collect();
-    OwnedValue::build_text(&result)
+    OwnedValue::build_text(&result, pool)
 }
 
 fn construct_like_regex(pattern: &str) -> Regex {
@@ -4056,9 +4579,10 @@ fn exec_substring(
     str_value: &OwnedValue,
     start_value: &OwnedValue,
     length_value: Option<&OwnedValue>,
+    pool: &mut StringPool,
 ) -> OwnedValue {
     if let (OwnedValue::Text(str), OwnedValue::Integer(start)) = (str_value, start_value) {
-        let str_len = str.as_str().len() as i64;
+        let str_len = str.as_str(pool).len() as i64;
 
         // The left-most character of X is number 1.
         // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
@@ -4077,15 +4601,18 @@ fn exec_substring(
         } else {
             (last_position, first_position)
         };
+
         OwnedValue::build_text(
-            &str.as_str()[start.clamp(-0, str_len) as usize..end.clamp(0, str_len) as usize],
+            &str.as_str(pool)[start.clamp(-0, str_len) as usize..end.clamp(0, str_len) as usize]
+                .to_string(),
+            pool,
         )
     } else {
         OwnedValue::Null
     }
 }
 
-fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
+fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     if reg == &OwnedValue::Null || pattern == &OwnedValue::Null {
         return OwnedValue::Null;
     }
@@ -4100,18 +4627,18 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
 
     let reg_str;
     let reg = match reg {
-        OwnedValue::Text(s) => s.as_str(),
+        OwnedValue::Text(s) => s.as_str(pool),
         _ => {
-            reg_str = reg.to_string();
+            reg_str = reg.to_string(pool);
             reg_str.as_str()
         }
     };
 
     let pattern_str;
     let pattern = match pattern {
-        OwnedValue::Text(s) => s.as_str(),
+        OwnedValue::Text(s) => s.as_str(pool),
         _ => {
-            pattern_str = pattern.to_string();
+            pattern_str = pattern.to_string(pool);
             pattern_str.as_str()
         }
     };
@@ -4122,42 +4649,46 @@ fn exec_instr(reg: &OwnedValue, pattern: &OwnedValue) -> OwnedValue {
     }
 }
 
-fn exec_typeof(reg: &OwnedValue) -> OwnedValue {
+fn exec_typeof(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match reg {
-        OwnedValue::Null => OwnedValue::build_text("null"),
-        OwnedValue::Integer(_) => OwnedValue::build_text("integer"),
-        OwnedValue::Float(_) => OwnedValue::build_text("real"),
-        OwnedValue::Text(_) => OwnedValue::build_text("text"),
-        OwnedValue::Blob(_) => OwnedValue::build_text("blob"),
+        OwnedValue::Null => OwnedValue::build_text("null", pool),
+        OwnedValue::Integer(_) => OwnedValue::build_text("integer", pool),
+        OwnedValue::Float(_) => OwnedValue::build_text("real", pool),
+        OwnedValue::Text(_) => OwnedValue::build_text("text", pool),
+        OwnedValue::Blob(_) => OwnedValue::build_text("blob", pool),
     }
 }
 
-fn exec_hex(reg: &OwnedValue) -> OwnedValue {
+fn exec_hex(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match reg {
         OwnedValue::Text(_)
         | OwnedValue::Integer(_)
         | OwnedValue::Float(_)
         | OwnedValue::Blob(_) => {
-            let text = reg.to_string();
-            OwnedValue::build_text(&hex::encode_upper(text))
+            let text = reg.to_string(pool);
+            OwnedValue::build_text(&hex::encode_upper(text), pool)
         }
         _ => OwnedValue::Null,
     }
 }
 
-fn exec_unhex(reg: &OwnedValue, ignored_chars: Option<&OwnedValue>) -> OwnedValue {
+fn exec_unhex(
+    reg: &OwnedValue,
+    ignored_chars: Option<&OwnedValue>,
+    pool: &mut StringPool,
+) -> OwnedValue {
     match reg {
         OwnedValue::Null => OwnedValue::Null,
         _ => match ignored_chars {
-            None => match hex::decode(reg.to_string()) {
+            None => match hex::decode(reg.to_string(pool)) {
                 Ok(bytes) => OwnedValue::Blob(bytes),
                 Err(_) => OwnedValue::Null,
             },
             Some(ignore) => match ignore {
                 OwnedValue::Text(_) => {
-                    let pat = ignore.to_string();
+                    let pat = ignore.to_string(pool);
                     let trimmed = reg
-                        .to_string()
+                        .to_string(pool)
                         .trim_start_matches(|x| pat.contains(x))
                         .trim_end_matches(|x| pat.contains(x))
                         .to_string();
@@ -4172,13 +4703,13 @@ fn exec_unhex(reg: &OwnedValue, ignored_chars: Option<&OwnedValue>) -> OwnedValu
     }
 }
 
-fn exec_unicode(reg: &OwnedValue) -> OwnedValue {
+fn exec_unicode(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match reg {
         OwnedValue::Text(_)
         | OwnedValue::Integer(_)
         | OwnedValue::Float(_)
         | OwnedValue::Blob(_) => {
-            let text = reg.to_string();
+            let text = reg.to_string(pool);
             if let Some(first_char) = text.chars().next() {
                 OwnedValue::Integer(first_char as u32 as i64)
             } else {
@@ -4189,9 +4720,9 @@ fn exec_unicode(reg: &OwnedValue) -> OwnedValue {
     }
 }
 
-fn _to_float(reg: &OwnedValue) -> f64 {
+fn _to_float(reg: &OwnedValue, pool: &mut StringPool) -> f64 {
     match reg {
-        OwnedValue::Text(x) => match cast_text_to_numeric(x.as_str()) {
+        OwnedValue::Text(x) => match cast_text_to_numeric(x.as_str(pool)) {
             OwnedValue::Integer(i) => i as f64,
             OwnedValue::Float(f) => f,
             _ => unreachable!(),
@@ -4202,14 +4733,18 @@ fn _to_float(reg: &OwnedValue) -> f64 {
     }
 }
 
-fn exec_round(reg: &OwnedValue, precision: Option<&OwnedValue>) -> OwnedValue {
-    let reg = _to_float(reg);
+fn exec_round(
+    reg: &OwnedValue,
+    precision: Option<&OwnedValue>,
+    pool: &mut StringPool,
+) -> OwnedValue {
+    let reg = _to_float(reg, pool);
     let round = |reg: f64, f: f64| {
         let precision = if f < 1.0 { 0.0 } else { f };
         OwnedValue::Float(reg.round_to_precision(precision as i32))
     };
     match precision {
-        Some(OwnedValue::Text(x)) => match cast_text_to_numeric(x.as_str()) {
+        Some(OwnedValue::Text(x)) => match cast_text_to_numeric(x.as_str(pool)) {
             OwnedValue::Integer(i) => round(reg, i as f64),
             OwnedValue::Float(f) => round(reg, f),
             _ => unreachable!(),
@@ -4222,55 +4757,68 @@ fn exec_round(reg: &OwnedValue, precision: Option<&OwnedValue>) -> OwnedValue {
 }
 
 // Implements TRIM pattern matching.
-fn exec_trim(reg: &OwnedValue, pattern: Option<&OwnedValue>) -> OwnedValue {
+fn exec_trim(reg: &OwnedValue, pattern: Option<&OwnedValue>, pool: &mut StringPool) -> OwnedValue {
     match (reg, pattern) {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(reg.to_string().trim_matches(&pattern_chars[..]))
+                let pattern_chars: Vec<char> = pattern.to_string(pool).chars().collect();
+                OwnedValue::build_text(reg.to_string(pool).trim_matches(&pattern_chars[..]), pool)
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim()),
+        (OwnedValue::Text(t), None) => {
+            OwnedValue::build_text(&t.as_str(pool).trim().to_string(), pool)
+        }
         (reg, _) => reg.to_owned(),
     }
 }
 
 // Implements LTRIM pattern matching.
-fn exec_ltrim(reg: &OwnedValue, pattern: Option<&OwnedValue>) -> OwnedValue {
+fn exec_ltrim(reg: &OwnedValue, pattern: Option<&OwnedValue>, pool: &mut StringPool) -> OwnedValue {
     match (reg, pattern) {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(reg.to_string().trim_start_matches(&pattern_chars[..]))
+                let pattern_chars: Vec<char> = pattern.to_string(pool).chars().collect();
+                OwnedValue::build_text(
+                    reg.to_string(pool).trim_start_matches(&pattern_chars[..]),
+                    pool,
+                )
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim_start()),
+        (OwnedValue::Text(t), None) => {
+            let t = t.as_str(pool).to_string();
+            OwnedValue::build_text(&t, pool)
+        }
         (reg, _) => reg.to_owned(),
     }
 }
 
 // Implements RTRIM pattern matching.
-fn exec_rtrim(reg: &OwnedValue, pattern: Option<&OwnedValue>) -> OwnedValue {
+fn exec_rtrim(reg: &OwnedValue, pattern: Option<&OwnedValue>, pool: &mut StringPool) -> OwnedValue {
     match (reg, pattern) {
         (reg, Some(pattern)) => match reg {
             OwnedValue::Text(_) | OwnedValue::Integer(_) | OwnedValue::Float(_) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                OwnedValue::build_text(reg.to_string().trim_end_matches(&pattern_chars[..]))
+                let pattern_chars: Vec<char> = pattern.to_string(pool).chars().collect();
+                OwnedValue::build_text(
+                    reg.to_string(pool).trim_end_matches(&pattern_chars[..]),
+                    pool,
+                )
             }
             _ => reg.to_owned(),
         },
-        (OwnedValue::Text(t), None) => OwnedValue::build_text(t.as_str().trim_end()),
+        (OwnedValue::Text(t), None) => {
+            OwnedValue::build_text(t.as_str(pool).to_string().trim_end(), pool)
+        }
         (reg, _) => reg.to_owned(),
     }
 }
 
-fn exec_zeroblob(req: &OwnedValue) -> OwnedValue {
+fn exec_zeroblob(req: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     let length: i64 = match req {
         OwnedValue::Integer(i) => *i,
         OwnedValue::Float(f) => *f as i64,
-        OwnedValue::Text(s) => s.as_str().parse().unwrap_or(0),
+        OwnedValue::Text(s) => s.as_str(pool).parse().unwrap_or(0),
         _ => 0,
     };
     OwnedValue::Blob(vec![0; length.max(0) as usize])
@@ -4286,7 +4834,7 @@ fn exec_if(reg: &OwnedValue, jump_if_null: bool, not: bool) -> bool {
     }
 }
 
-fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
+fn exec_cast(value: &OwnedValue, datatype: &str, pool: &mut StringPool) -> OwnedValue {
     if matches!(value, OwnedValue::Null) {
         return OwnedValue::Null;
     }
@@ -4296,7 +4844,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
         Affinity::Blob => {
             // Convert to TEXT first, then interpret as BLOB
             // TODO: handle encoding
-            let text = value.to_string();
+            let text = value.to_string(pool);
             OwnedValue::Blob(text.into_bytes())
         }
         // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
@@ -4304,7 +4852,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
         Affinity::Text => {
             // Convert everything to text representation
             // TODO: handle encoding and whatever sqlite3_snprintf does
-            OwnedValue::build_text(&value.to_string())
+            OwnedValue::build_text(&value.to_string(pool), pool)
         }
         Affinity::Real => match value {
             OwnedValue::Blob(b) => {
@@ -4312,7 +4860,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_real(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_real(t.as_str()),
+            OwnedValue::Text(t) => cast_text_to_real(t.as_str(pool)),
             OwnedValue::Integer(i) => OwnedValue::Float(*i as f64),
             OwnedValue::Float(f) => OwnedValue::Float(*f),
             _ => OwnedValue::Float(0.0),
@@ -4323,7 +4871,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_integer(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_integer(t.as_str()),
+            OwnedValue::Text(t) => cast_text_to_integer(t.as_str(pool)),
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
             // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
@@ -4346,7 +4894,7 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
                 let text = String::from_utf8_lossy(b);
                 cast_text_to_numeric(&text)
             }
-            OwnedValue::Text(t) => cast_text_to_numeric(t.as_str()),
+            OwnedValue::Text(t) => cast_text_to_numeric(t.as_str(pool)),
             OwnedValue::Integer(i) => OwnedValue::Integer(*i),
             OwnedValue::Float(f) => OwnedValue::Float(*f),
             _ => value.clone(), // TODO probably wrong
@@ -4354,7 +4902,12 @@ fn exec_cast(value: &OwnedValue, datatype: &str) -> OwnedValue {
     }
 }
 
-fn exec_replace(source: &OwnedValue, pattern: &OwnedValue, replacement: &OwnedValue) -> OwnedValue {
+fn exec_replace(
+    source: &OwnedValue,
+    pattern: &OwnedValue,
+    replacement: &OwnedValue,
+    pool: &mut StringPool,
+) -> OwnedValue {
     // The replace(X,Y,Z) function returns a string formed by substituting string Z for every occurrence of
     // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
     // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
@@ -4367,21 +4920,21 @@ fn exec_replace(source: &OwnedValue, pattern: &OwnedValue, replacement: &OwnedVa
         return OwnedValue::Null;
     }
 
-    let source = exec_cast(source, "TEXT");
-    let pattern = exec_cast(pattern, "TEXT");
-    let replacement = exec_cast(replacement, "TEXT");
+    let source = exec_cast(source, "TEXT", pool);
+    let pattern = exec_cast(pattern, "TEXT", pool);
+    let replacement = exec_cast(replacement, "TEXT", pool);
 
     // If any of the casts failed, panic as text casting is not expected to fail.
     match (&source, &pattern, &replacement) {
         (OwnedValue::Text(source), OwnedValue::Text(pattern), OwnedValue::Text(replacement)) => {
-            if pattern.as_str().is_empty() {
+            if pattern.as_str(pool).is_empty() {
                 return OwnedValue::Text(source.clone());
             }
 
             let result = source
-                .as_str()
-                .replace(pattern.as_str(), replacement.as_str());
-            OwnedValue::build_text(&result)
+                .as_str(pool)
+                .replace(pattern.as_str(pool), replacement.as_str(pool));
+            OwnedValue::build_text(&result, pool)
         }
         _ => unreachable!("text cast should never fail"),
     }
@@ -4395,16 +4948,16 @@ fn execute_sqlite_version(version_integer: i64) -> String {
     format!("{}.{}.{}", major, minor, release)
 }
 
-fn to_f64(reg: &OwnedValue) -> Option<f64> {
+fn to_f64(reg: &OwnedValue, pool: &StringPool) -> Option<f64> {
     match reg {
         OwnedValue::Integer(i) => Some(*i as f64),
         OwnedValue::Float(f) => Some(*f),
-        OwnedValue::Text(t) => t.as_str().parse::<f64>().ok(),
+        OwnedValue::Text(t) => t.as_str(pool).parse::<f64>().ok(),
         _ => None,
     }
 }
 
-fn exec_math_unary(reg: &OwnedValue, function: &MathFunc) -> OwnedValue {
+fn exec_math_unary(reg: &OwnedValue, function: &MathFunc, pool: &mut StringPool) -> OwnedValue {
     // In case of some functions and integer input, return the input as is
     if let OwnedValue::Integer(_) = reg {
         if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
@@ -4413,7 +4966,7 @@ fn exec_math_unary(reg: &OwnedValue, function: &MathFunc) -> OwnedValue {
         }
     }
 
-    let f = match to_f64(reg) {
+    let f = match to_f64(reg, pool) {
         Some(f) => f,
         None => return OwnedValue::Null,
     };
@@ -4451,13 +5004,18 @@ fn exec_math_unary(reg: &OwnedValue, function: &MathFunc) -> OwnedValue {
     }
 }
 
-fn exec_math_binary(lhs: &OwnedValue, rhs: &OwnedValue, function: &MathFunc) -> OwnedValue {
-    let lhs = match to_f64(lhs) {
+fn exec_math_binary(
+    lhs: &OwnedValue,
+    rhs: &OwnedValue,
+    function: &MathFunc,
+    pool: &StringPool,
+) -> OwnedValue {
+    let lhs = match to_f64(lhs, pool) {
         Some(f) => f,
         None => return OwnedValue::Null,
     };
 
-    let rhs = match to_f64(rhs) {
+    let rhs = match to_f64(rhs, pool) {
         Some(f) => f,
         None => return OwnedValue::Null,
     };
@@ -4476,14 +5034,14 @@ fn exec_math_binary(lhs: &OwnedValue, rhs: &OwnedValue, function: &MathFunc) -> 
     }
 }
 
-fn exec_math_log(arg: &OwnedValue, base: Option<&OwnedValue>) -> OwnedValue {
-    let f = match to_f64(arg) {
+fn exec_math_log(arg: &OwnedValue, base: Option<&OwnedValue>, pool: &StringPool) -> OwnedValue {
+    let f = match to_f64(arg, pool) {
         Some(f) => f,
         None => return OwnedValue::Null,
     };
 
     let base = match base {
-        Some(base) => match to_f64(base) {
+        Some(base) => match to_f64(base, pool) {
             Some(f) => f,
             None => return OwnedValue::Null,
         },
@@ -4500,13 +5058,13 @@ fn exec_math_log(arg: &OwnedValue, base: Option<&OwnedValue>) -> OwnedValue {
 }
 
 pub trait FromValueRow<'a> {
-    fn from_value(value: &'a OwnedValue) -> Result<Self>
+    fn from_value(value: &'a OwnedValue, pool: &'a mut StringPool) -> Result<Self>
     where
         Self: Sized + 'a;
 }
 
 impl<'a> FromValueRow<'a> for i64 {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a OwnedValue, pool: &mut StringPool) -> Result<Self> {
         match value {
             OwnedValue::Integer(i) => Ok(*i),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
@@ -4515,37 +5073,41 @@ impl<'a> FromValueRow<'a> for i64 {
 }
 
 impl<'a> FromValueRow<'a> for String {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a OwnedValue, pool: &mut StringPool) -> Result<Self> {
         match value {
-            OwnedValue::Text(s) => Ok(s.as_str().to_string()),
+            OwnedValue::Text(s) => Ok(s.as_str(pool).to_string()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
 }
 
 impl<'a> FromValueRow<'a> for &'a str {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a OwnedValue, pool: &'a mut StringPool) -> Result<Self> {
         match value {
-            OwnedValue::Text(s) => Ok(s.as_str()),
+            OwnedValue::Text(s) => Ok(s.as_str(pool)),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
 }
 
 impl<'a> FromValueRow<'a> for &'a OwnedValue {
-    fn from_value(value: &'a OwnedValue) -> Result<Self> {
+    fn from_value(value: &'a OwnedValue, _: &mut StringPool) -> Result<Self> {
         Ok(value)
     }
 }
 
 impl Row {
-    pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
+    pub fn get<'a, T: FromValueRow<'a> + 'a>(
+        &'a self,
+        idx: usize,
+        pool: &'a mut StringPool,
+    ) -> Result<T> {
         let value = unsafe { self.values.add(idx).as_ref().unwrap() };
         let value = match value {
             Register::OwnedValue(owned_value) => owned_value,
             _ => unreachable!("a row should be formed of values only"),
         };
-        T::from_value(value)
+        T::from_value(value, pool)
     }
 
     pub fn get_value<'a>(&'a self, idx: usize) -> &'a OwnedValue {
@@ -4566,919 +5128,5 @@ impl Row {
 
     pub fn len(&self) -> usize {
         self.count
-    }
-}
-#[cfg(test)]
-mod tests {
-    use crate::vdbe::{exec_replace, Register};
-
-    use super::{
-        exec_abs, exec_char, exec_hex, exec_if, exec_instr, exec_length, exec_like, exec_lower,
-        exec_ltrim, exec_max, exec_min, exec_nullif, exec_quote, exec_random, exec_randomblob,
-        exec_round, exec_rtrim, exec_sign, exec_soundex, exec_substring, exec_trim, exec_typeof,
-        exec_unhex, exec_unicode, exec_upper, exec_zeroblob, execute_sqlite_version, Bitfield,
-        OwnedValue,
-    };
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_length() {
-        let input_str = OwnedValue::build_text("bob");
-        let expected_len = OwnedValue::Integer(3);
-        assert_eq!(exec_length(&input_str), expected_len);
-
-        let input_integer = OwnedValue::Integer(123);
-        let expected_len = OwnedValue::Integer(3);
-        assert_eq!(exec_length(&input_integer), expected_len);
-
-        let input_float = OwnedValue::Float(123.456);
-        let expected_len = OwnedValue::Integer(7);
-        assert_eq!(exec_length(&input_float), expected_len);
-
-        let expected_blob = OwnedValue::Blob("example".as_bytes().to_vec());
-        let expected_len = OwnedValue::Integer(7);
-        assert_eq!(exec_length(&expected_blob), expected_len);
-    }
-
-    #[test]
-    fn test_quote() {
-        let input = OwnedValue::build_text("abc\0edf");
-        let expected = OwnedValue::build_text("'abc'");
-        assert_eq!(exec_quote(&input), expected);
-
-        let input = OwnedValue::Integer(123);
-        let expected = OwnedValue::Integer(123);
-        assert_eq!(exec_quote(&input), expected);
-
-        let input = OwnedValue::build_text("hello''world");
-        let expected = OwnedValue::build_text("'hello''''world'");
-        assert_eq!(exec_quote(&input), expected);
-    }
-
-    #[test]
-    fn test_typeof() {
-        let input = OwnedValue::Null;
-        let expected: OwnedValue = OwnedValue::build_text("null");
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Integer(123);
-        let expected: OwnedValue = OwnedValue::build_text("integer");
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Float(123.456);
-        let expected: OwnedValue = OwnedValue::build_text("real");
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::build_text("hello");
-        let expected: OwnedValue = OwnedValue::build_text("text");
-        assert_eq!(exec_typeof(&input), expected);
-
-        let input = OwnedValue::Blob("limbo".as_bytes().to_vec());
-        let expected: OwnedValue = OwnedValue::build_text("blob");
-        assert_eq!(exec_typeof(&input), expected);
-    }
-
-    #[test]
-    fn test_unicode() {
-        assert_eq!(
-            exec_unicode(&OwnedValue::build_text("a")),
-            OwnedValue::Integer(97)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::build_text("😊")),
-            OwnedValue::Integer(128522)
-        );
-        assert_eq!(exec_unicode(&OwnedValue::build_text("")), OwnedValue::Null);
-        assert_eq!(
-            exec_unicode(&OwnedValue::Integer(23)),
-            OwnedValue::Integer(50)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Integer(0)),
-            OwnedValue::Integer(48)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Float(0.0)),
-            OwnedValue::Integer(48)
-        );
-        assert_eq!(
-            exec_unicode(&OwnedValue::Float(23.45)),
-            OwnedValue::Integer(50)
-        );
-        assert_eq!(exec_unicode(&OwnedValue::Null), OwnedValue::Null);
-        assert_eq!(
-            exec_unicode(&OwnedValue::Blob("example".as_bytes().to_vec())),
-            OwnedValue::Integer(101)
-        );
-    }
-
-    #[test]
-    fn test_min_max() {
-        let input_int_vec = vec![
-            Register::OwnedValue(OwnedValue::Integer(-1)),
-            Register::OwnedValue(OwnedValue::Integer(10)),
-        ];
-        assert_eq!(exec_min(&input_int_vec), OwnedValue::Integer(-1));
-        assert_eq!(exec_max(&input_int_vec), OwnedValue::Integer(10));
-
-        let str1 = Register::OwnedValue(OwnedValue::build_text("A"));
-        let str2 = Register::OwnedValue(OwnedValue::build_text("z"));
-        let input_str_vec = vec![str2, str1.clone()];
-        assert_eq!(exec_min(&input_str_vec), OwnedValue::build_text("A"));
-        assert_eq!(exec_max(&input_str_vec), OwnedValue::build_text("z"));
-
-        let input_null_vec = vec![
-            Register::OwnedValue(OwnedValue::Null),
-            Register::OwnedValue(OwnedValue::Null),
-        ];
-        assert_eq!(exec_min(&input_null_vec), OwnedValue::Null);
-        assert_eq!(exec_max(&input_null_vec), OwnedValue::Null);
-
-        let input_mixed_vec = vec![Register::OwnedValue(OwnedValue::Integer(10)), str1];
-        assert_eq!(exec_min(&input_mixed_vec), OwnedValue::Integer(10));
-        assert_eq!(exec_max(&input_mixed_vec), OwnedValue::build_text("A"));
-    }
-
-    #[test]
-    fn test_trim() {
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let expected_str = OwnedValue::build_text("Bob and Alice");
-        assert_eq!(exec_trim(&input_str, None), expected_str);
-
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("Bob and");
-        let expected_str = OwnedValue::build_text("Alice");
-        assert_eq!(exec_trim(&input_str, Some(&pattern_str)), expected_str);
-    }
-
-    #[test]
-    fn test_ltrim() {
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let expected_str = OwnedValue::build_text("Bob and Alice     ");
-        assert_eq!(exec_ltrim(&input_str, None), expected_str);
-
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("Bob and");
-        let expected_str = OwnedValue::build_text("Alice     ");
-        assert_eq!(exec_ltrim(&input_str, Some(&pattern_str)), expected_str);
-    }
-
-    #[test]
-    fn test_rtrim() {
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let expected_str = OwnedValue::build_text("     Bob and Alice");
-        assert_eq!(exec_rtrim(&input_str, None), expected_str);
-
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("Bob and");
-        let expected_str = OwnedValue::build_text("     Bob and Alice");
-        assert_eq!(exec_rtrim(&input_str, Some(&pattern_str)), expected_str);
-
-        let input_str = OwnedValue::build_text("     Bob and Alice     ");
-        let pattern_str = OwnedValue::build_text("and Alice");
-        let expected_str = OwnedValue::build_text("     Bob");
-        assert_eq!(exec_rtrim(&input_str, Some(&pattern_str)), expected_str);
-    }
-
-    #[test]
-    fn test_soundex() {
-        let input_str = OwnedValue::build_text("Pfister");
-        let expected_str = OwnedValue::build_text("P236");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("husobee");
-        let expected_str = OwnedValue::build_text("H210");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Tymczak");
-        let expected_str = OwnedValue::build_text("T522");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Ashcraft");
-        let expected_str = OwnedValue::build_text("A261");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Robert");
-        let expected_str = OwnedValue::build_text("R163");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Rupert");
-        let expected_str = OwnedValue::build_text("R163");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Rubin");
-        let expected_str = OwnedValue::build_text("R150");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Kant");
-        let expected_str = OwnedValue::build_text("K530");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("Knuth");
-        let expected_str = OwnedValue::build_text("K530");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("x");
-        let expected_str = OwnedValue::build_text("X000");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-
-        let input_str = OwnedValue::build_text("闪电五连鞭");
-        let expected_str = OwnedValue::build_text("?000");
-        assert_eq!(exec_soundex(&input_str), expected_str);
-    }
-
-    #[test]
-    fn test_upper_case() {
-        let input_str = OwnedValue::build_text("Limbo");
-        let expected_str = OwnedValue::build_text("LIMBO");
-        assert_eq!(exec_upper(&input_str).unwrap(), expected_str);
-
-        let input_int = OwnedValue::Integer(10);
-        assert_eq!(exec_upper(&input_int).unwrap(), input_int);
-        assert_eq!(exec_upper(&OwnedValue::Null).unwrap(), OwnedValue::Null)
-    }
-
-    #[test]
-    fn test_lower_case() {
-        let input_str = OwnedValue::build_text("Limbo");
-        let expected_str = OwnedValue::build_text("limbo");
-        assert_eq!(exec_lower(&input_str).unwrap(), expected_str);
-
-        let input_int = OwnedValue::Integer(10);
-        assert_eq!(exec_lower(&input_int).unwrap(), input_int);
-        assert_eq!(exec_lower(&OwnedValue::Null).unwrap(), OwnedValue::Null)
-    }
-
-    #[test]
-    fn test_hex() {
-        let input_str = OwnedValue::build_text("limbo");
-        let expected_val = OwnedValue::build_text("6C696D626F");
-        assert_eq!(exec_hex(&input_str), expected_val);
-
-        let input_int = OwnedValue::Integer(100);
-        let expected_val = OwnedValue::build_text("313030");
-        assert_eq!(exec_hex(&input_int), expected_val);
-
-        let input_float = OwnedValue::Float(12.34);
-        let expected_val = OwnedValue::build_text("31322E3334");
-        assert_eq!(exec_hex(&input_float), expected_val);
-    }
-
-    #[test]
-    fn test_unhex() {
-        let input = OwnedValue::build_text("6f");
-        let expected = OwnedValue::Blob(vec![0x6f]);
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text("6f");
-        let expected = OwnedValue::Blob(vec![0x6f]);
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text("611");
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text("");
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::build_text("61x");
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_unhex(&input, None), expected);
-
-        let input = OwnedValue::Null;
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_unhex(&input, None), expected);
-    }
-
-    #[test]
-    fn test_abs() {
-        let int_positive_reg = OwnedValue::Integer(10);
-        let int_negative_reg = OwnedValue::Integer(-10);
-        assert_eq!(exec_abs(&int_positive_reg).unwrap(), int_positive_reg);
-        assert_eq!(exec_abs(&int_negative_reg).unwrap(), int_positive_reg);
-
-        let float_positive_reg = OwnedValue::Integer(10);
-        let float_negative_reg = OwnedValue::Integer(-10);
-        assert_eq!(exec_abs(&float_positive_reg).unwrap(), float_positive_reg);
-        assert_eq!(exec_abs(&float_negative_reg).unwrap(), float_positive_reg);
-
-        assert_eq!(
-            exec_abs(&OwnedValue::build_text("a")).unwrap(),
-            OwnedValue::Float(0.0)
-        );
-        assert_eq!(exec_abs(&OwnedValue::Null).unwrap(), OwnedValue::Null);
-
-        // ABS(i64::MIN) should return RuntimeError
-        assert!(exec_abs(&OwnedValue::Integer(i64::MIN)).is_err());
-    }
-
-    #[test]
-    fn test_char() {
-        assert_eq!(
-            exec_char(&[
-                Register::OwnedValue(OwnedValue::Integer(108)),
-                Register::OwnedValue(OwnedValue::Integer(105))
-            ]),
-            OwnedValue::build_text("li")
-        );
-        assert_eq!(exec_char(&[]), OwnedValue::build_text(""));
-        assert_eq!(
-            exec_char(&[Register::OwnedValue(OwnedValue::Null)]),
-            OwnedValue::build_text("")
-        );
-        assert_eq!(
-            exec_char(&[Register::OwnedValue(OwnedValue::build_text("a"))]),
-            OwnedValue::build_text("")
-        );
-    }
-
-    #[test]
-    fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(exec_like(None, "%a%a", "aaaa"));
-    }
-
-    #[test]
-    fn test_like_no_cache() {
-        assert!(exec_like(None, "a%", "aaaa"));
-        assert!(exec_like(None, "%a%a", "aaaa"));
-        assert!(!exec_like(None, "%a.a", "aaaa"));
-        assert!(!exec_like(None, "a.a%", "aaaa"));
-        assert!(!exec_like(None, "%a.ab", "aaaa"));
-    }
-
-    #[test]
-    fn test_like_with_cache() {
-        let mut cache = HashMap::new();
-        assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
-
-        // again after values have been cached
-        assert!(exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!exec_like(Some(&mut cache), "%a.ab", "aaaa"));
-    }
-
-    #[test]
-    fn test_random() {
-        match exec_random() {
-            OwnedValue::Integer(value) => {
-                // Check that the value is within the range of i64
-                assert!(
-                    (i64::MIN..=i64::MAX).contains(&value),
-                    "Random number out of range"
-                );
-            }
-            _ => panic!("exec_random did not return an Integer variant"),
-        }
-    }
-
-    #[test]
-    fn test_exec_randomblob() {
-        struct TestCase {
-            input: OwnedValue,
-            expected_len: usize,
-        }
-
-        let test_cases = vec![
-            TestCase {
-                input: OwnedValue::Integer(5),
-                expected_len: 5,
-            },
-            TestCase {
-                input: OwnedValue::Integer(0),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::Integer(-1),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::build_text(""),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::build_text("5"),
-                expected_len: 5,
-            },
-            TestCase {
-                input: OwnedValue::build_text("0"),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::build_text("-1"),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::Float(2.9),
-                expected_len: 2,
-            },
-            TestCase {
-                input: OwnedValue::Float(-3.15),
-                expected_len: 1,
-            },
-            TestCase {
-                input: OwnedValue::Null,
-                expected_len: 1,
-            },
-        ];
-
-        for test_case in &test_cases {
-            let result = exec_randomblob(&test_case.input);
-            match result {
-                OwnedValue::Blob(blob) => {
-                    assert_eq!(blob.len(), test_case.expected_len);
-                }
-                _ => panic!("exec_randomblob did not return a Blob variant"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_exec_round() {
-        let input_val = OwnedValue::Float(123.456);
-        let expected_val = OwnedValue::Float(123.0);
-        assert_eq!(exec_round(&input_val, None), expected_val);
-
-        let input_val = OwnedValue::Float(123.456);
-        let precision_val = OwnedValue::Integer(2);
-        let expected_val = OwnedValue::Float(123.46);
-        assert_eq!(exec_round(&input_val, Some(&precision_val)), expected_val);
-
-        let input_val = OwnedValue::Float(123.456);
-        let precision_val = OwnedValue::build_text("1");
-        let expected_val = OwnedValue::Float(123.5);
-        assert_eq!(exec_round(&input_val, Some(&precision_val)), expected_val);
-
-        let input_val = OwnedValue::build_text("123.456");
-        let precision_val = OwnedValue::Integer(2);
-        let expected_val = OwnedValue::Float(123.46);
-        assert_eq!(exec_round(&input_val, Some(&precision_val)), expected_val);
-
-        let input_val = OwnedValue::Integer(123);
-        let precision_val = OwnedValue::Integer(1);
-        let expected_val = OwnedValue::Float(123.0);
-        assert_eq!(exec_round(&input_val, Some(&precision_val)), expected_val);
-
-        let input_val = OwnedValue::Float(100.123);
-        let expected_val = OwnedValue::Float(100.0);
-        assert_eq!(exec_round(&input_val, None), expected_val);
-
-        let input_val = OwnedValue::Float(100.123);
-        let expected_val = OwnedValue::Null;
-        assert_eq!(
-            exec_round(&input_val, Some(&OwnedValue::Null)),
-            expected_val
-        );
-    }
-
-    #[test]
-    fn test_exec_if() {
-        let reg = OwnedValue::Integer(0);
-        assert!(!exec_if(&reg, false, false));
-        assert!(exec_if(&reg, false, true));
-
-        let reg = OwnedValue::Integer(1);
-        assert!(exec_if(&reg, false, false));
-        assert!(!exec_if(&reg, false, true));
-
-        let reg = OwnedValue::Null;
-        assert!(!exec_if(&reg, false, false));
-        assert!(!exec_if(&reg, false, true));
-
-        let reg = OwnedValue::Null;
-        assert!(exec_if(&reg, true, false));
-        assert!(exec_if(&reg, true, true));
-
-        let reg = OwnedValue::Null;
-        assert!(!exec_if(&reg, false, false));
-        assert!(!exec_if(&reg, false, true));
-    }
-
-    #[test]
-    fn test_nullif() {
-        assert_eq!(
-            exec_nullif(&OwnedValue::Integer(1), &OwnedValue::Integer(1)),
-            OwnedValue::Null
-        );
-        assert_eq!(
-            exec_nullif(&OwnedValue::Float(1.1), &OwnedValue::Float(1.1)),
-            OwnedValue::Null
-        );
-        assert_eq!(
-            exec_nullif(
-                &OwnedValue::build_text("limbo"),
-                &OwnedValue::build_text("limbo")
-            ),
-            OwnedValue::Null
-        );
-
-        assert_eq!(
-            exec_nullif(&OwnedValue::Integer(1), &OwnedValue::Integer(2)),
-            OwnedValue::Integer(1)
-        );
-        assert_eq!(
-            exec_nullif(&OwnedValue::Float(1.1), &OwnedValue::Float(1.2)),
-            OwnedValue::Float(1.1)
-        );
-        assert_eq!(
-            exec_nullif(
-                &OwnedValue::build_text("limbo"),
-                &OwnedValue::build_text("limb")
-            ),
-            OwnedValue::build_text("limbo")
-        );
-    }
-
-    #[test]
-    fn test_substring() {
-        let str_value = OwnedValue::build_text("limbo");
-        let start_value = OwnedValue::Integer(1);
-        let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text("lim");
-        assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
-            expected_val
-        );
-
-        let str_value = OwnedValue::build_text("limbo");
-        let start_value = OwnedValue::Integer(1);
-        let length_value = OwnedValue::Integer(10);
-        let expected_val = OwnedValue::build_text("limbo");
-        assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
-            expected_val
-        );
-
-        let str_value = OwnedValue::build_text("limbo");
-        let start_value = OwnedValue::Integer(10);
-        let length_value = OwnedValue::Integer(3);
-        let expected_val = OwnedValue::build_text("");
-        assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
-            expected_val
-        );
-
-        let str_value = OwnedValue::build_text("limbo");
-        let start_value = OwnedValue::Integer(3);
-        let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text("mbo");
-        assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
-            expected_val
-        );
-
-        let str_value = OwnedValue::build_text("limbo");
-        let start_value = OwnedValue::Integer(10);
-        let length_value = OwnedValue::Null;
-        let expected_val = OwnedValue::build_text("");
-        assert_eq!(
-            exec_substring(&str_value, &start_value, Some(&length_value)),
-            expected_val
-        );
-    }
-
-    #[test]
-    fn test_exec_instr() {
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("im");
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("limbo");
-        let expected = OwnedValue::Integer(1);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("o");
-        let expected = OwnedValue::Integer(5);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("liiiiimbo");
-        let pattern = OwnedValue::build_text("ii");
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("limboX");
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::build_text("");
-        let expected = OwnedValue::Integer(1);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("");
-        let pattern = OwnedValue::build_text("limbo");
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("");
-        let pattern = OwnedValue::build_text("");
-        let expected = OwnedValue::Integer(1);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Null;
-        let pattern = OwnedValue::Null;
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("limbo");
-        let pattern = OwnedValue::Null;
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Null;
-        let pattern = OwnedValue::build_text("limbo");
-        let expected = OwnedValue::Null;
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Integer(123);
-        let pattern = OwnedValue::Integer(2);
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Integer(123);
-        let pattern = OwnedValue::Integer(5);
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::Float(2.3);
-        let expected = OwnedValue::Integer(2);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::Float(5.6);
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Float(12.34);
-        let pattern = OwnedValue::build_text(".");
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Blob(vec![1, 2, 3, 4, 5]);
-        let pattern = OwnedValue::Blob(vec![3, 4]);
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Blob(vec![1, 2, 3, 4, 5]);
-        let pattern = OwnedValue::Blob(vec![3, 2]);
-        let expected = OwnedValue::Integer(0);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::Blob(vec![0x61, 0x62, 0x63, 0x64, 0x65]);
-        let pattern = OwnedValue::build_text("cd");
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-
-        let input = OwnedValue::build_text("abcde");
-        let pattern = OwnedValue::Blob(vec![0x63, 0x64]);
-        let expected = OwnedValue::Integer(3);
-        assert_eq!(exec_instr(&input, &pattern), expected);
-    }
-
-    #[test]
-    fn test_exec_sign() {
-        let input = OwnedValue::Integer(42);
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Integer(-42);
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Integer(0);
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Float(0.0);
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Float(0.1);
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Float(42.0);
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Float(-42.0);
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text("abc");
-        let expected = Some(OwnedValue::Null);
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text("42");
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text("-42");
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::build_text("0");
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(b"abc".to_vec());
-        let expected = Some(OwnedValue::Null);
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(b"42".to_vec());
-        let expected = Some(OwnedValue::Integer(1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(b"-42".to_vec());
-        let expected = Some(OwnedValue::Integer(-1));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Blob(b"0".to_vec());
-        let expected = Some(OwnedValue::Integer(0));
-        assert_eq!(exec_sign(&input), expected);
-
-        let input = OwnedValue::Null;
-        let expected = Some(OwnedValue::Null);
-        assert_eq!(exec_sign(&input), expected);
-    }
-
-    #[test]
-    fn test_exec_zeroblob() {
-        let input = OwnedValue::Integer(0);
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Null;
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Integer(4);
-        let expected = OwnedValue::Blob(vec![0; 4]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Integer(-1);
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::build_text("5");
-        let expected = OwnedValue::Blob(vec![0; 5]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::build_text("-5");
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::build_text("text");
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Float(2.6);
-        let expected = OwnedValue::Blob(vec![0; 2]);
-        assert_eq!(exec_zeroblob(&input), expected);
-
-        let input = OwnedValue::Blob(vec![1]);
-        let expected = OwnedValue::Blob(vec![]);
-        assert_eq!(exec_zeroblob(&input), expected);
-    }
-
-    #[test]
-    fn test_execute_sqlite_version() {
-        let version_integer = 3046001;
-        let expected = "3.46.1";
-        assert_eq!(execute_sqlite_version(version_integer), expected);
-    }
-
-    #[test]
-    fn test_replace() {
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("b");
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("aoa");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("b");
-        let replace_str = OwnedValue::build_text("");
-        let expected_str = OwnedValue::build_text("o");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("b");
-        let replace_str = OwnedValue::build_text("abc");
-        let expected_str = OwnedValue::build_text("abcoabc");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("a");
-        let replace_str = OwnedValue::build_text("b");
-        let expected_str = OwnedValue::build_text("bob");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::build_text("");
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("bob");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bob");
-        let pattern_str = OwnedValue::Null;
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::Null;
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bo5");
-        let pattern_str = OwnedValue::Integer(5);
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("boa");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bo5.0");
-        let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("boa");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bo5");
-        let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::build_text("a");
-        let expected_str = OwnedValue::build_text("bo5");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        let input_str = OwnedValue::build_text("bo5.0");
-        let pattern_str = OwnedValue::Float(5.0);
-        let replace_str = OwnedValue::Float(6.0);
-        let expected_str = OwnedValue::build_text("bo6.0");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-
-        // todo: change this test to use (0.1 + 0.2) instead of 0.3 when decimals are implemented.
-        let input_str = OwnedValue::build_text("tes3");
-        let pattern_str = OwnedValue::Integer(3);
-        let replace_str = OwnedValue::Float(0.3);
-        let expected_str = OwnedValue::build_text("tes0.3");
-        assert_eq!(
-            exec_replace(&input_str, &pattern_str, &replace_str),
-            expected_str
-        );
-    }
-
-    #[test]
-    fn test_bitfield() {
-        let mut bitfield = Bitfield::<4>::new();
-        for i in 0..256 {
-            bitfield.set(i);
-            assert!(bitfield.get(i));
-            for j in 0..i {
-                assert!(bitfield.get(j));
-            }
-            for j in i + 1..256 {
-                assert!(!bitfield.get(j));
-            }
-        }
-        for i in 0..256 {
-            bitfield.unset(i);
-            assert!(!bitfield.get(i));
-        }
     }
 }

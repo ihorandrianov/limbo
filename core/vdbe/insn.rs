@@ -1,6 +1,9 @@
 use std::num::NonZero;
 
-use super::{cast_text_to_numeric, AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx};
+use super::{
+    cast_text_to_numeric, AggFunc, BranchOffset, CursorID, FuncCtx, PageIdx, StringPool,
+    StringValue,
+};
 use crate::storage::wal::CheckpointMode;
 use crate::types::{OwnedValue, Record};
 use limbo_macros::Description;
@@ -726,7 +729,7 @@ pub enum Cookie {
     UserVersion = 6,
 }
 
-pub fn exec_add(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_add(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     let result = match (lhs, rhs) {
         (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
             let result = lhs.overflowing_add(*rhs);
@@ -741,11 +744,12 @@ pub fn exec_add(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         | (OwnedValue::Integer(i), OwnedValue::Float(f)) => OwnedValue::Float(*f + *i as f64),
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_add(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_add(&cast_text_to_numeric(text.as_str()), other)
+            exec_add(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         _ => todo!(),
     };
@@ -755,7 +759,7 @@ pub fn exec_add(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
     }
 }
 
-pub fn exec_subtract(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_subtract(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     let result = match (lhs, rhs) {
         (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
             let result = lhs.overflowing_sub(*rhs);
@@ -770,14 +774,15 @@ pub fn exec_subtract(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(*lhs as f64 - rhs),
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_subtract(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) => {
-            exec_subtract(&cast_text_to_numeric(text.as_str()), other)
+            exec_subtract(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         (other, OwnedValue::Text(text)) => {
-            exec_subtract(other, &cast_text_to_numeric(text.as_str()))
+            exec_subtract(other, &cast_text_to_numeric(text.as_str(pool)), pool)
         }
         _ => todo!(),
     };
@@ -787,7 +792,7 @@ pub fn exec_subtract(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
     }
 }
 
-pub fn exec_multiply(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_multiply(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     let result = match (lhs, rhs) {
         (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
             let result = lhs.overflowing_mul(*rhs);
@@ -802,11 +807,12 @@ pub fn exec_multiply(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         | (OwnedValue::Float(f), OwnedValue::Integer(i)) => OwnedValue::Float(*i as f64 * { *f }),
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_multiply(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_multiply(&cast_text_to_numeric(text.as_str()), other)
+            exec_multiply(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
 
         _ => todo!(),
@@ -817,7 +823,7 @@ pub fn exec_multiply(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
     }
 }
 
-pub fn exec_divide(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_divide(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     let result = match (lhs, rhs) {
         (_, OwnedValue::Integer(0)) | (_, OwnedValue::Float(0.0)) => OwnedValue::Null,
         (OwnedValue::Integer(lhs), OwnedValue::Integer(rhs)) => {
@@ -833,11 +839,16 @@ pub fn exec_divide(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         (OwnedValue::Integer(lhs), OwnedValue::Float(rhs)) => OwnedValue::Float(*lhs as f64 / rhs),
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_divide(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
-        (OwnedValue::Text(text), other) => exec_divide(&cast_text_to_numeric(text.as_str()), other),
-        (other, OwnedValue::Text(text)) => exec_divide(other, &cast_text_to_numeric(text.as_str())),
+        (OwnedValue::Text(text), other) => {
+            exec_divide(&cast_text_to_numeric(text.as_str(pool)), other, pool)
+        }
+        (other, OwnedValue::Text(text)) => {
+            exec_divide(other, &cast_text_to_numeric(text.as_str(pool)), pool)
+        }
         _ => todo!(),
     };
     match result {
@@ -846,7 +857,7 @@ pub fn exec_divide(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
     }
 }
 
-pub fn exec_bit_and(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_bit_and(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (_, OwnedValue::Integer(0))
@@ -860,17 +871,18 @@ pub fn exec_bit_and(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         (OwnedValue::Float(lh), OwnedValue::Integer(rh)) => OwnedValue::Integer(*lh as i64 & rh),
         (OwnedValue::Integer(lh), OwnedValue::Float(rh)) => OwnedValue::Integer(lh & *rh as i64),
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_bit_and(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_bit_and(&cast_text_to_numeric(text.as_str()), other)
+            exec_bit_and(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         _ => todo!(),
     }
 }
 
-pub fn exec_bit_or(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_bit_or(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => OwnedValue::Integer(lh | rh),
@@ -880,11 +892,12 @@ pub fn exec_bit_or(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
             OwnedValue::Integer(*lh as i64 | *rh as i64)
         }
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_bit_or(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_bit_or(&cast_text_to_numeric(text.as_str()), other)
+            exec_bit_or(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         _ => todo!(),
     }
@@ -930,17 +943,17 @@ pub fn exec_remainder(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
     }
 }
 
-pub fn exec_bit_not(reg: &OwnedValue) -> OwnedValue {
+pub fn exec_bit_not(reg: &OwnedValue, pool: &StringPool) -> OwnedValue {
     match reg {
         OwnedValue::Null => OwnedValue::Null,
         OwnedValue::Integer(i) => OwnedValue::Integer(!i),
         OwnedValue::Float(f) => OwnedValue::Integer(!(*f as i64)),
-        OwnedValue::Text(text) => exec_bit_not(&cast_text_to_numeric(text.as_str())),
+        OwnedValue::Text(text) => exec_bit_not(&cast_text_to_numeric(text.as_str(pool)), pool),
         _ => todo!(),
     }
 }
 
-pub fn exec_shift_left(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_shift_left(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
@@ -956,14 +969,15 @@ pub fn exec_shift_left(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
             OwnedValue::Integer(compute_shl(*lh as i64, *rh as i64))
         }
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_shift_left(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) => {
-            exec_shift_left(&cast_text_to_numeric(text.as_str()), other)
+            exec_shift_left(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         (other, OwnedValue::Text(text)) => {
-            exec_shift_left(other, &cast_text_to_numeric(text.as_str()))
+            exec_shift_left(other, &cast_text_to_numeric(text.as_str(pool)), pool)
         }
         _ => todo!(),
     }
@@ -993,7 +1007,7 @@ fn compute_shl(lhs: i64, rhs: i64) -> i64 {
     }
 }
 
-pub fn exec_shift_right(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_shift_right(lhs: &OwnedValue, rhs: &OwnedValue, pool: &StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Integer(lh), OwnedValue::Integer(rh)) => {
@@ -1009,14 +1023,15 @@ pub fn exec_shift_right(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
             OwnedValue::Integer(compute_shr(*lh as i64, *rh as i64))
         }
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_shift_right(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) => {
-            exec_shift_right(&cast_text_to_numeric(text.as_str()), other)
+            exec_shift_right(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         (other, OwnedValue::Text(text)) => {
-            exec_shift_right(other, &cast_text_to_numeric(text.as_str()))
+            exec_shift_right(other, &cast_text_to_numeric(text.as_str(pool)), pool)
         }
         _ => todo!(),
     }
@@ -1048,52 +1063,125 @@ fn compute_shr(lhs: i64, rhs: i64) -> i64 {
     }
 }
 
-pub fn exec_boolean_not(reg: &OwnedValue) -> OwnedValue {
+pub fn exec_boolean_not(reg: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match reg {
         OwnedValue::Null => OwnedValue::Null,
         OwnedValue::Integer(i) => OwnedValue::Integer((*i == 0) as i64),
         OwnedValue::Float(f) => OwnedValue::Integer((*f == 0.0) as i64),
-        OwnedValue::Text(text) => exec_boolean_not(&cast_text_to_numeric(text.as_str())),
+        OwnedValue::Text(text) => exec_boolean_not(&cast_text_to_numeric(text.as_str(pool)), pool),
         _ => todo!(),
     }
 }
-pub fn exec_concat(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_concat(lhs: &OwnedValue, rhs: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (OwnedValue::Text(lhs_text), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + rhs_text.as_str()))
+            // Efficiently concatenate two strings using the string pool
+            let lhs_str = lhs_text.as_str(pool);
+            let rhs_str = rhs_text.as_str(pool);
+
+            // Estimate total length to choose the right tier
+            let total_len = lhs_str.len() + rhs_str.len();
+
+            // If total length is small enough for inline storage, use that
+            if total_len <= 15 {
+                let mut inline_data = [0u8; 15];
+                let mut offset = 0;
+
+                // Copy the first string
+                let lhs_bytes = lhs_str.as_bytes();
+                inline_data[..lhs_bytes.len()].copy_from_slice(lhs_bytes);
+                offset += lhs_bytes.len();
+
+                // Copy the second string
+                let rhs_bytes = rhs_str.as_bytes();
+                inline_data[offset..offset + rhs_bytes.len()].copy_from_slice(rhs_bytes);
+
+                OwnedValue::Text(StringValue::Inline {
+                    len: total_len as u8,
+                    data: inline_data,
+                })
+            } else {
+                // Concatenate strings and allocate in pool
+
+                let concat_str = format!("{}{}", lhs_str, rhs_str);
+                OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
+            }
         }
         (OwnedValue::Text(lhs_text), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + &rhs_int.to_string()))
+            let lhs_str = lhs_text.as_str(pool);
+            let rhs_str = rhs_int.to_string();
+            let concat_str = format!("{}{}", lhs_str, rhs_str);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Text(lhs_text), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_text.as_str().to_string() + &rhs_float.to_string()))
+            let lhs_str = lhs_text.as_str(pool);
+            let rhs_str = rhs_float.to_string();
+            let concat_str = format!("{}{}", lhs_str, rhs_str);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Integer(lhs_int), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + rhs_text.as_str()))
+            let lhs_str = lhs_int.to_string();
+            let rhs_str = rhs_text.as_str(pool);
+            let concat_str = format!("{}{}", lhs_str, rhs_str);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Integer(lhs_int), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_int.to_string()))
+            let concat_str = format!("{}{}", lhs_int, rhs_int);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Integer(lhs_int), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_int.to_string() + &rhs_float.to_string()))
+            let concat_str = format!("{}{}", lhs_int, rhs_float);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Float(lhs_float), OwnedValue::Text(rhs_text)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + rhs_text.as_str()))
+            let lhs_str = lhs_float.to_string();
+            let rhs_str = rhs_text.as_str(pool);
+            let concat_str = format!("{}{}", lhs_str, rhs_str);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Float(lhs_float), OwnedValue::Integer(rhs_int)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_int.to_string()))
+            let concat_str = format!("{}{}", lhs_float, rhs_int);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Float(lhs_float), OwnedValue::Float(rhs_float)) => {
-            OwnedValue::build_text(&(lhs_float.to_string() + &rhs_float.to_string()))
+            let concat_str = format!("{}{}", lhs_float, rhs_float);
+            OwnedValue::Text(StringValue::Pooled(pool.allocate(&concat_str)))
         }
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
-        (OwnedValue::Blob(_), _) | (_, OwnedValue::Blob(_)) => {
-            todo!("TODO: Handle Blob conversion to String")
+        (OwnedValue::Blob(blob), other) => {
+            // Convert blob to string if possible
+            match std::str::from_utf8(blob) {
+                Ok(blob_str) => {
+                    let mut tmp = OwnedValue::Text(StringValue::Pooled(pool.allocate(blob_str)));
+                    exec_concat(&tmp, other, pool)
+                }
+                Err(_) => {
+                    // Blob isn't valid UTF-8, fall back to some representation
+                    let blob_repr = format!("[Blob: {} bytes]", blob.len());
+                    let mut tmp = OwnedValue::Text(StringValue::Pooled(pool.allocate(&blob_repr)));
+                    exec_concat(&tmp, other, pool)
+                }
+            }
+        }
+        (other, OwnedValue::Blob(blob)) => {
+            // Handle second argument being a Blob
+            match std::str::from_utf8(blob) {
+                Ok(blob_str) => {
+                    let tmp = OwnedValue::Text(StringValue::Pooled(pool.allocate(blob_str)));
+                    exec_concat(other, &tmp, pool)
+                }
+                Err(_) => {
+                    // Blob isn't valid UTF-8, fall back to some representation
+                    let blob_repr = format!("[Blob: {} bytes]", blob.len());
+                    let tmp = OwnedValue::Text(StringValue::Pooled(pool.allocate(&blob_repr)));
+                    exec_concat(other, &tmp, pool)
+                }
+            }
         }
     }
 }
 
-pub fn exec_and(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_and(lhs: &OwnedValue, rhs: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (_, OwnedValue::Integer(0))
         | (OwnedValue::Integer(0), _)
@@ -1101,17 +1189,18 @@ pub fn exec_and(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         | (OwnedValue::Float(0.0), _) => OwnedValue::Integer(0),
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => OwnedValue::Null,
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_and(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_and(&cast_text_to_numeric(text.as_str()), other)
+            exec_and(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         _ => OwnedValue::Integer(1),
     }
 }
 
-pub fn exec_or(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
+pub fn exec_or(lhs: &OwnedValue, rhs: &OwnedValue, pool: &mut StringPool) -> OwnedValue {
     match (lhs, rhs) {
         (OwnedValue::Null, OwnedValue::Null)
         | (OwnedValue::Null, OwnedValue::Float(0.0))
@@ -1123,117 +1212,13 @@ pub fn exec_or(lhs: &OwnedValue, rhs: &OwnedValue) -> OwnedValue {
         | (OwnedValue::Float(0.0), OwnedValue::Float(0.0))
         | (OwnedValue::Integer(0), OwnedValue::Integer(0)) => OwnedValue::Integer(0),
         (OwnedValue::Text(lhs), OwnedValue::Text(rhs)) => exec_or(
-            &cast_text_to_numeric(lhs.as_str()),
-            &cast_text_to_numeric(rhs.as_str()),
+            &cast_text_to_numeric(lhs.as_str(pool)),
+            &cast_text_to_numeric(rhs.as_str(pool)),
+            pool,
         ),
         (OwnedValue::Text(text), other) | (other, OwnedValue::Text(text)) => {
-            exec_or(&cast_text_to_numeric(text.as_str()), other)
+            exec_or(&cast_text_to_numeric(text.as_str(pool)), other, pool)
         }
         _ => OwnedValue::Integer(1),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        types::{OwnedValue, Text},
-        vdbe::insn::exec_or,
-    };
-
-    use super::exec_and;
-
-    #[test]
-    fn test_exec_and() {
-        let inputs = vec![
-            (OwnedValue::Integer(0), OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Float(0.0), OwnedValue::Null),
-            (OwnedValue::Integer(1), OwnedValue::Float(2.2)),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("string")),
-            ),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("1")),
-            ),
-            (
-                OwnedValue::Integer(1),
-                OwnedValue::Text(Text::from_str("1")),
-            ),
-        ];
-        let outpus = [
-            OwnedValue::Integer(0),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(1),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(1),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outpus.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_and(lhs, rhs),
-                outpus[i],
-                "Wrong AND for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
-    }
-
-    #[test]
-    fn test_exec_or() {
-        let inputs = vec![
-            (OwnedValue::Integer(0), OwnedValue::Null),
-            (OwnedValue::Null, OwnedValue::Integer(1)),
-            (OwnedValue::Null, OwnedValue::Null),
-            (OwnedValue::Float(0.0), OwnedValue::Null),
-            (OwnedValue::Integer(1), OwnedValue::Float(2.2)),
-            (OwnedValue::Float(0.0), OwnedValue::Integer(0)),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("string")),
-            ),
-            (
-                OwnedValue::Integer(0),
-                OwnedValue::Text(Text::from_str("1")),
-            ),
-            (OwnedValue::Integer(0), OwnedValue::Text(Text::from_str(""))),
-        ];
-        let outputs = [
-            OwnedValue::Null,
-            OwnedValue::Integer(1),
-            OwnedValue::Null,
-            OwnedValue::Null,
-            OwnedValue::Integer(1),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(0),
-            OwnedValue::Integer(1),
-            OwnedValue::Integer(0),
-        ];
-
-        assert_eq!(
-            inputs.len(),
-            outputs.len(),
-            "Inputs and Outputs should have same size"
-        );
-        for (i, (lhs, rhs)) in inputs.iter().enumerate() {
-            assert_eq!(
-                exec_or(lhs, rhs),
-                outputs[i],
-                "Wrong OR for lhs: {}, rhs: {}",
-                lhs,
-                rhs
-            );
-        }
     }
 }

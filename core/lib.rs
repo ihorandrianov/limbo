@@ -65,7 +65,7 @@ use translate::select::prepare_select_plan;
 pub use types::OwnedValue;
 pub use types::RefValue;
 use util::{columns_from_create_table_body, parse_schema_rows};
-use vdbe::{builder::QueryMode, VTabOpaqueCursor};
+use vdbe::{builder::QueryMode, StringPool, VTabOpaqueCursor};
 
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
@@ -666,11 +666,12 @@ impl VirtualTable {
         cursor: &VTabOpaqueCursor,
         arg_count: usize,
         args: Vec<OwnedValue>,
+        pool: &mut StringPool,
     ) -> Result<bool> {
         let mut filter_args = Vec::with_capacity(arg_count);
         for i in 0..arg_count {
             let ownedvalue_arg = args.get(i).unwrap();
-            filter_args.push(ownedvalue_arg.to_ffi());
+            filter_args.push(ownedvalue_arg.to_ffi(pool));
         }
         let rc = unsafe {
             (self.implementation.filter)(cursor.as_ptr(), arg_count as i32, filter_args.as_ptr())
@@ -687,9 +688,14 @@ impl VirtualTable {
         }
     }
 
-    pub fn column(&self, cursor: &VTabOpaqueCursor, column: usize) -> Result<OwnedValue> {
+    pub fn column(
+        &self,
+        cursor: &VTabOpaqueCursor,
+        column: usize,
+        pool: &mut StringPool,
+    ) -> Result<OwnedValue> {
         let val = unsafe { (self.implementation.column)(cursor.as_ptr(), column as u32) };
-        OwnedValue::from_ffi(val)
+        OwnedValue::from_ffi(val, pool)
     }
 
     pub fn next(&self, cursor: &VTabOpaqueCursor) -> Result<bool> {
@@ -701,9 +707,9 @@ impl VirtualTable {
         }
     }
 
-    pub fn update(&self, args: &[OwnedValue]) -> Result<Option<i64>> {
+    pub fn update(&self, args: &[OwnedValue], pool: &mut StringPool) -> Result<Option<i64>> {
         let arg_count = args.len();
-        let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
+        let ext_args = args.iter().map(|arg| arg.to_ffi(pool)).collect::<Vec<_>>();
         let newrowid = 0i64;
         let implementation = self.implementation.as_ref();
         let rc = unsafe {

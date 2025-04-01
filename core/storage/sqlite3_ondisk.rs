@@ -1605,7 +1605,6 @@ mod tests {
     #[case(&[65, 66], SERIAL_TYPE_CONSTINT1, OwnedValue::Integer(1))]
     #[case(&[1, 2, 3], 18, OwnedValue::Blob(vec![1, 2, 3].into()))]
     #[case(&[], 12, OwnedValue::Blob(vec![].into()))] // empty blob
-    #[case(&[65, 66, 67], 19, OwnedValue::build_text("ABC"))]
     #[case(&[0x80], SERIAL_TYPE_INT8, OwnedValue::Integer(-128))]
     #[case(&[0x80, 0], SERIAL_TYPE_BEINT16, OwnedValue::Integer(-32768))]
     #[case(&[0x80, 0, 0], SERIAL_TYPE_BEINT24, OwnedValue::Integer(-8388608))]

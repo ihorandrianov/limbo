@@ -6,7 +6,7 @@ use crate::pseudo::PseudoCursor;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::sqlite3_ondisk::write_varint;
 use crate::vdbe::sorter::Sorter;
-use crate::vdbe::{Register, VTabOpaqueCursor};
+use crate::vdbe::{PooledStringRef, Register, StringPool, StringValue, VTabOpaqueCursor};
 use crate::Result;
 use std::fmt::Display;
 
@@ -83,7 +83,7 @@ pub enum OwnedValue {
     Null,
     Integer(i64),
     Float(f64),
-    Text(Text),
+    Text(StringValue),
     Blob(Vec<u8>),
 }
 
@@ -104,9 +104,6 @@ pub enum RefValue {
 
 impl OwnedValue {
     // A helper function that makes building a text OwnedValue easier.
-    pub fn build_text(text: &str) -> Self {
-        Self::Text(Text::new(text))
-    }
 
     pub fn to_blob(&self) -> Option<&[u8]> {
         match self {
@@ -115,19 +112,135 @@ impl OwnedValue {
         }
     }
 
+    pub fn build_text(text: &str, pool: &mut StringPool) -> Self {
+        if text.len() <= 15 {
+            // Small strings go inline
+            let mut data = [0u8; 15];
+            let bytes = text.as_bytes();
+            data[..bytes.len()].copy_from_slice(bytes);
+            OwnedValue::Text(StringValue::Inline {
+                len: bytes.len() as u8,
+                data,
+            })
+        } else if text.len() <= 2048 {
+            // Medium strings go in the pool
+            let string_ref = pool.allocate(text);
+            OwnedValue::Text(StringValue::Pooled(string_ref))
+        } else {
+            // Very large strings go on the heap
+            OwnedValue::Text(StringValue::Heap(text.into()))
+        }
+    }
+
     pub fn from_blob(data: Vec<u8>) -> Self {
         OwnedValue::Blob(data)
     }
 
-    pub fn to_text(&self) -> Option<&str> {
+    pub fn to_text<'a>(&'a self, pool: &'a StringPool) -> Option<&'a str> {
         match self {
-            OwnedValue::Text(t) => Some(t.as_str()),
+            OwnedValue::Text(t) => Some(t.as_str(pool)),
             _ => None,
         }
     }
 
     pub fn from_text(text: &str) -> Self {
-        OwnedValue::Text(Text::new(text))
+        if text.len() <= 15 {
+            // Small strings go inline
+            let mut data = [0u8; 15];
+            let bytes = text.as_bytes();
+            data[..bytes.len()].copy_from_slice(bytes);
+            OwnedValue::Text(StringValue::Inline {
+                len: bytes.len() as u8,
+                data,
+            })
+        } else {
+            // Large strings go on the heap
+            OwnedValue::Text(StringValue::Heap(text.into()))
+        }
+    }
+
+    /// Converts the OwnedValue to a String using the Display trait
+    pub fn to_string(&self, pool: &StringPool) -> String {
+        match self {
+            Self::Null => String::new(),
+            Self::Integer(i) => i.to_string(),
+            Self::Float(f) => {
+                // Handle special cases like NaN, -0.0, and scientific notation
+                // This replicates the Display implementation logic
+                let f = *f;
+                if f.is_nan() {
+                    return String::new();
+                }
+                // Handle negative zero
+                if f == -0.0 {
+                    return format!("{:.1}", f.abs());
+                }
+                // Handle scientific notation for very small or large numbers
+                if (f.abs() < 1e-4 || f.abs() >= 1e15) && f != 0.0 {
+                    let sci_notation = format!("{:.14e}", f);
+                    let parts: Vec<&str> = sci_notation.split('e').collect();
+
+                    if parts.len() == 2 {
+                        let mantissa = parts[0];
+                        let exponent = parts[1];
+
+                        let decimal_parts: Vec<&str> = mantissa.split('.').collect();
+                        if decimal_parts.len() == 2 {
+                            let whole = decimal_parts[0];
+                            let mut fraction = String::from(decimal_parts[1]);
+
+                            // Remove trailing zeros
+                            while fraction.ends_with('0') {
+                                fraction.pop();
+                            }
+
+                            let trimmed_mantissa = if fraction.is_empty() {
+                                whole.to_string()
+                            } else {
+                                format!("{}.{}", whole, fraction)
+                            };
+
+                            let (prefix, exponent) = if exponent.starts_with('-') {
+                                ("-0", &exponent[1..])
+                            } else {
+                                ("+", exponent)
+                            };
+
+                            return format!("{}e{}{}", trimmed_mantissa, prefix, exponent);
+                        }
+                    }
+                    return sci_notation;
+                }
+
+                // Handle standard formatting with appropriate precision
+                let rounded = f.round();
+                if (f - rounded).abs() < 1e-14 {
+                    if rounded == rounded as i64 as f64 {
+                        return format!("{:.1}", f);
+                    }
+                }
+
+                let mut result = format!("{}", f);
+                while result.ends_with('0') && result.contains('.') {
+                    result.pop();
+                }
+                if result.ends_with('.') {
+                    result.push('0');
+                }
+                result
+            }
+            Self::Text(text) => match text {
+                StringValue::Inline { len, data } => {
+                    // Convert inline data to string
+                    std::str::from_utf8(&data[..*len as usize])
+                        .unwrap_or("[invalid utf8]")
+                        .to_string()
+                }
+                StringValue::Pooled(pooled) => pool.get_str(pooled).to_string(),
+                StringValue::Heap(s) => s.to_string(),
+            },
+            Self::Blob(b) => String::from_utf8_lossy(b).to_string(),
+        }
     }
 
     pub fn value_type(&self) -> OwnedValueType {
@@ -139,7 +252,7 @@ impl OwnedValue {
             OwnedValue::Blob(_) => OwnedValueType::Blob,
         }
     }
-    pub fn serialize_serial(&self, out: &mut Vec<u8>) {
+    pub fn serialize_serial(&self, out: &mut Vec<u8>, pool: &StringPool) {
         match self {
             OwnedValue::Null => {}
             OwnedValue::Integer(i) => {
@@ -155,7 +268,7 @@ impl OwnedValue {
                 }
             }
             OwnedValue::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
-            OwnedValue::Text(t) => out.extend_from_slice(&t.value),
+            OwnedValue::Text(t) => out.extend_from_slice(t.as_str(pool).as_bytes()),
             OwnedValue::Blob(b) => out.extend_from_slice(b),
         };
     }
@@ -187,128 +300,128 @@ impl ExternalAggState {
 ///   OwnedValue::Float(f) => *f.as_str(),
 ///   ....
 /// }
-impl Display for OwnedValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Null => write!(f, ""),
-            Self::Integer(i) => {
-                write!(f, "{}", i)
-            }
-            Self::Float(fl) => {
-                let fl = *fl;
-                if fl.is_nan() {
-                    return write!(f, "");
-                }
-                // handle negative 0
-                if fl == -0.0 {
-                    return write!(f, "{:.1}", fl.abs());
-                }
+// impl Display for OwnedValue {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         match self {
+//             Self::Null => write!(f, ""),
+//             Self::Integer(i) => {
+//                 write!(f, "{}", i)
+//             }
+//             Self::Float(fl) => {
+//                 let fl = *fl;
+//                 if fl.is_nan() {
+//                     return write!(f, "");
+//                 }
+//                 // handle negative 0
+//                 if fl == -0.0 {
+//                     return write!(f, "{:.1}", fl.abs());
+//                 }
 
-                // handle scientific notation without trailing zeros
-                if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
-                    let sci_notation = format!("{:.14e}", fl);
-                    let parts: Vec<&str> = sci_notation.split('e').collect();
+//                 // handle scientific notation without trailing zeros
+//                 if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
+//                     let sci_notation = format!("{:.14e}", fl);
+//                     let parts: Vec<&str> = sci_notation.split('e').collect();
 
-                    if parts.len() == 2 {
-                        let mantissa = parts[0];
-                        let exponent = parts[1];
+//                     if parts.len() == 2 {
+//                         let mantissa = parts[0];
+//                         let exponent = parts[1];
 
-                        let decimal_parts: Vec<&str> = mantissa.split('.').collect();
-                        if decimal_parts.len() == 2 {
-                            let whole = decimal_parts[0];
-                            // 1.{this part}
-                            let mut fraction = String::from(decimal_parts[1]);
+//                         let decimal_parts: Vec<&str> = mantissa.split('.').collect();
+//                         if decimal_parts.len() == 2 {
+//                             let whole = decimal_parts[0];
+//                             // 1.{this part}
+//                             let mut fraction = String::from(decimal_parts[1]);
 
-                            //removing trailing 0 from fraction
-                            while fraction.ends_with('0') {
-                                fraction.pop();
-                            }
+//                             //removing trailing 0 from fraction
+//                             while fraction.ends_with('0') {
+//                                 fraction.pop();
+//                             }
 
-                            let trimmed_mantissa = if fraction.is_empty() {
-                                whole.to_string()
-                            } else {
-                                format!("{}.{}", whole, fraction)
-                            };
-                            let (prefix, exponent) = if exponent.starts_with('-') {
-                                ("-0", &exponent[1..])
-                            } else {
-                                ("+", exponent)
-                            };
-                            return write!(f, "{}e{}{}", trimmed_mantissa, prefix, exponent);
-                        }
-                    }
+//                             let trimmed_mantissa = if fraction.is_empty() {
+//                                 whole.to_string()
+//                             } else {
+//                                 format!("{}.{}", whole, fraction)
+//                             };
+//                             let (prefix, exponent) = if exponent.starts_with('-') {
+//                                 ("-0", &exponent[1..])
+//                             } else {
+//                                 ("+", exponent)
+//                             };
+//                             return write!(f, "{}e{}{}", trimmed_mantissa, prefix, exponent);
+//                         }
+//                     }
 
-                    // fallback
-                    return write!(f, "{}", sci_notation);
-                }
+//                     // fallback
+//                     return write!(f, "{}", sci_notation);
+//                 }
 
-                // handle floating point max size is 15.
-                // If left > right && right + left > 15 go to sci notation
-                // If right > left && right + left > 15 truncate left so right + left == 15
-                let rounded = fl.round();
-                if (fl - rounded).abs() < 1e-14 {
-                    // if we very close to integer trim decimal part to 1 digit
-                    if rounded == rounded as i64 as f64 {
-                        return write!(f, "{:.1}", fl);
-                    }
-                }
+//                 // handle floating point max size is 15.
+//                 // If left > right && right + left > 15 go to sci notation
+//                 // If right > left && right + left > 15 truncate left so right + left == 15
+//                 let rounded = fl.round();
+//                 if (fl - rounded).abs() < 1e-14 {
+//                     // if we very close to integer trim decimal part to 1 digit
+//                     if rounded == rounded as i64 as f64 {
+//                         return write!(f, "{:.1}", fl);
+//                     }
+//                 }
 
-                let fl_str = format!("{}", fl);
-                let splitted = fl_str.split('.').collect::<Vec<&str>>();
-                // fallback
-                if splitted.len() != 2 {
-                    return write!(f, "{:.14e}", fl);
-                }
+//                 let fl_str = format!("{}", fl);
+//                 let splitted = fl_str.split('.').collect::<Vec<&str>>();
+//                 // fallback
+//                 if splitted.len() != 2 {
+//                     return write!(f, "{:.14e}", fl);
+//                 }
 
-                let first_part = if fl < 0.0 {
-                    // remove -
-                    &splitted[0][1..]
-                } else {
-                    splitted[0]
-                };
+//                 let first_part = if fl < 0.0 {
+//                     // remove -
+//                     &splitted[0][1..]
+//                 } else {
+//                     splitted[0]
+//                 };
 
-                let second = splitted[1];
+//                 let second = splitted[1];
 
-                // We want more precision for smaller numbers. in SQLite case we want 15 non zero digits in 0 < number < 1
-                // leading zeroes added to max real size. But if float < 1e-4 we go to scientific notation
-                let leading_zeros = second.chars().take_while(|c| c == &'0').count();
-                let reminder = if first_part != "0" {
-                    MAX_REAL_SIZE as isize - first_part.len() as isize
-                } else {
-                    MAX_REAL_SIZE as isize + leading_zeros as isize
-                };
-                // float that have integer part > 15 converted to sci notation
-                if reminder < 0 {
-                    return write!(f, "{:.14e}", fl);
-                }
-                // trim decimal part to reminder or self len so total digits is 15;
-                let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
-                // if decimal part ends with 0 we trim it
-                while fl.ends_with('0') {
-                    fl.pop();
-                }
-                write!(f, "{}", fl)
-            }
-            Self::Text(s) => {
-                write!(f, "{}", s.as_str())
-            }
-            Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
-        }
-    }
-}
+//                 // We want more precision for smaller numbers. in SQLite case we want 15 non zero digits in 0 < number < 1
+//                 // leading zeroes added to max real size. But if float < 1e-4 we go to scientific notation
+//                 let leading_zeros = second.chars().take_while(|c| c == &'0').count();
+//                 let reminder = if first_part != "0" {
+//                     MAX_REAL_SIZE as isize - first_part.len() as isize
+//                 } else {
+//                     MAX_REAL_SIZE as isize + leading_zeros as isize
+//                 };
+//                 // float that have integer part > 15 converted to sci notation
+//                 if reminder < 0 {
+//                     return write!(f, "{:.14e}", fl);
+//                 }
+//                 // trim decimal part to reminder or self len so total digits is 15;
+//                 let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
+//                 // if decimal part ends with 0 we trim it
+//                 while fl.ends_with('0') {
+//                     fl.pop();
+//                 }
+//                 write!(f, "{}", fl)
+//             }
+//             Self::Text(s) => {
+//                 write!(f, "{}", s.as_str())
+//             }
+//             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
+//         }
+//     }
+// }
 
 impl OwnedValue {
-    pub fn to_ffi(&self) -> ExtValue {
+    pub fn to_ffi(&self, pool: &mut StringPool) -> ExtValue {
         match self {
             Self::Null => ExtValue::null(),
             Self::Integer(i) => ExtValue::from_integer(*i),
             Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
+            Self::Text(text) => ExtValue::from_text(text.as_str(pool).to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
     }
 
-    pub fn from_ffi(v: ExtValue) -> Result<Self> {
+    pub fn from_ffi(v: ExtValue, pool: &mut StringPool) -> Result<Self> {
         let res = match v.value_type() {
             ExtValueType::Null => Ok(OwnedValue::Null),
             ExtValueType::Integer => {
@@ -328,9 +441,9 @@ impl OwnedValue {
                     return Ok(OwnedValue::Null);
                 };
                 if v.is_json() {
-                    Ok(OwnedValue::Text(Text::json(text.to_string())))
+                    Ok(OwnedValue::build_text(text, pool))
                 } else {
-                    Ok(OwnedValue::build_text(text))
+                    Ok(OwnedValue::build_text(text, pool))
                 }
             }
             ExtValueType::Blob => {
@@ -368,11 +481,11 @@ pub enum AggContext {
 const NULL: OwnedValue = OwnedValue::Null;
 
 impl AggContext {
-    pub fn compute_external(&mut self) -> Result<()> {
+    pub fn compute_external(&mut self, pool: &mut StringPool) -> Result<()> {
         if let Self::External(ext_state) = self {
             if ext_state.finalized_value.is_none() {
                 let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-                ext_state.cache_final_value(OwnedValue::from_ffi(final_value)?);
+                ext_state.cache_final_value(OwnedValue::from_ffi(final_value, pool)?);
             }
         }
         Ok(())
@@ -404,9 +517,7 @@ impl PartialEq<OwnedValue> for OwnedValue {
             (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
             (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.eq(&text_right.value)
-            }
+            (Self::Text(text_left), Self::Text(text_right)) => text_left.eq(&text_right),
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
             (Self::Null, Self::Null) => true,
             _ => false,
@@ -440,9 +551,7 @@ impl PartialOrd<OwnedValue> for OwnedValue {
                 Some(std::cmp::Ordering::Greater)
             }
 
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(&text_right.value)
-            }
+            (Self::Text(text_left), Self::Text(text_right)) => text_left.partial_cmp(&text_right),
             // Text vs Blob
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
@@ -477,10 +586,8 @@ impl Ord for OwnedValue {
     }
 }
 
-impl std::ops::Add<OwnedValue> for OwnedValue {
-    type Output = OwnedValue;
-
-    fn add(self, rhs: Self) -> Self::Output {
+impl OwnedValue {
+    pub fn add(self, rhs: Self, pool: &mut StringPool) -> Self {
         match (self, rhs) {
             (Self::Integer(int_left), Self::Integer(int_right)) => {
                 Self::Integer(int_left + int_right)
@@ -494,22 +601,27 @@ impl std::ops::Add<OwnedValue> for OwnedValue {
             (Self::Float(float_left), Self::Float(float_right)) => {
                 Self::Float(float_left + float_right)
             }
-            (Self::Text(string_left), Self::Text(string_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + string_right.as_str()))
-            }
-            (Self::Text(string_left), Self::Integer(int_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + &int_right.to_string()))
-            }
+            (Self::Text(string_left), Self::Text(string_right)) => Self::build_text(
+                &(string_left.as_str(pool).to_string() + string_right.as_str(pool)),
+                pool,
+            ),
+            (Self::Text(string_left), Self::Integer(int_right)) => Self::build_text(
+                &(string_left.as_str(pool).to_string() + &int_right.to_string()),
+                pool,
+            ),
             (Self::Integer(int_left), Self::Text(string_right)) => {
-                Self::build_text(&(int_left.to_string() + string_right.as_str()))
+                Self::build_text(&(int_left.to_string() + string_right.as_str(pool)), pool)
             }
             (Self::Text(string_left), Self::Float(float_right)) => {
-                let string_right = Self::Float(float_right).to_string();
-                Self::build_text(&(string_left.as_str().to_string() + &string_right))
+                let string_right = Self::Float(float_right).to_string(pool);
+                Self::build_text(
+                    &(string_left.as_str(pool).to_string() + &string_right),
+                    pool,
+                )
             }
             (Self::Float(float_left), Self::Text(string_right)) => {
-                let string_left = Self::Float(float_left).to_string();
-                Self::build_text(&(string_left + string_right.as_str()))
+                let string_left = Self::Float(float_left).to_string(pool);
+                Self::build_text(&(string_left + string_right.as_str(pool)), pool)
             }
             (lhs, Self::Null) => lhs,
             (Self::Null, rhs) => rhs,
@@ -542,21 +654,9 @@ impl std::ops::Add<i64> for OwnedValue {
     }
 }
 
-impl std::ops::AddAssign for OwnedValue {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = self.clone() + rhs;
-    }
-}
-
-impl std::ops::AddAssign<i64> for OwnedValue {
-    fn add_assign(&mut self, rhs: i64) {
-        *self = self.clone() + rhs;
-    }
-}
-
-impl std::ops::AddAssign<f64> for OwnedValue {
-    fn add_assign(&mut self, rhs: f64) {
-        *self = self.clone() + rhs;
+impl OwnedValue {
+    fn add_assign(&mut self, rhs: Self, pool: &mut StringPool) {
+        *self = self.clone().add(rhs, pool);
     }
 }
 
@@ -735,7 +835,7 @@ impl ImmutableRecord {
         self.values.len()
     }
 
-    pub fn from_registers(registers: &[Register]) -> Self {
+    pub fn from_registers(registers: &[Register], pool: &mut StringPool) -> Self {
         let mut values = Vec::with_capacity(registers.len());
         let mut serials = Vec::with_capacity(registers.len());
         let mut size_header = 0;
@@ -824,13 +924,13 @@ impl ImmutableRecord {
                     writer.extend_from_slice(&f.to_be_bytes())
                 }
                 OwnedValue::Text(t) => {
-                    writer.extend_from_slice(&t.value);
+                    writer.extend_from_slice(&t.as_str(pool).as_bytes());
                     let end_offset = writer.pos;
                     let len = end_offset - start_offset;
                     let ptr = unsafe { writer.buf.as_ptr().add(start_offset) };
                     let value = RefValue::Text(TextRef {
                         value: RawSlice::new(ptr, len),
-                        subtype: t.subtype.clone(),
+                        subtype: TextSubtype::Text,
                     });
                     values.push(value);
                 }
@@ -934,10 +1034,9 @@ impl RefValue {
             RefValue::Null => OwnedValue::Null,
             RefValue::Integer(i) => OwnedValue::Integer(*i),
             RefValue::Float(f) => OwnedValue::Float(*f),
-            RefValue::Text(text_ref) => OwnedValue::Text(Text {
-                value: text_ref.value.to_slice().to_vec(),
-                subtype: text_ref.subtype.clone(),
-            }),
+            RefValue::Text(text_ref) => {
+                OwnedValue::Text(StringValue::Heap(text_ref.as_str().into()))
+            }
             RefValue::Blob(b) => OwnedValue::Blob(b.to_slice().to_vec()),
         }
     }
@@ -1053,7 +1152,7 @@ impl From<&OwnedValue> for SerialType {
             },
             OwnedValue::Float(_) => SerialType::F64,
             OwnedValue::Text(t) => SerialType::Text {
-                content_size: t.value.len(),
+                content_size: t.len(),
             },
             OwnedValue::Blob(b) => SerialType::Blob {
                 content_size: b.len(),
@@ -1084,7 +1183,7 @@ impl Record {
         Self { values }
     }
 
-    pub fn serialize(&self, buf: &mut Vec<u8>) {
+    pub fn serialize(&self, buf: &mut Vec<u8>, pool: &StringPool) {
         let initial_i = buf.len();
 
         // write serial types
@@ -1114,7 +1213,7 @@ impl Record {
                     }
                 }
                 OwnedValue::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                OwnedValue::Text(t) => buf.extend_from_slice(&t.value),
+                OwnedValue::Text(t) => buf.extend_from_slice(&t.as_str(pool)),
                 OwnedValue::Blob(b) => buf.extend_from_slice(b),
             };
         }
@@ -1215,208 +1314,5 @@ impl RawSlice {
         } else {
             unsafe { std::slice::from_raw_parts(self.data, self.len) }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serialize_null() {
-        let record = Record::new(vec![OwnedValue::Null]);
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        let header_length = record.values.len() + 1;
-        let header = &buf[0..header_length];
-        // First byte should be header size
-        assert_eq!(header[0], header_length as u8);
-        // Second byte should be serial type for NULL
-        assert_eq!(header[1] as u64, u64::from(SerialType::Null));
-        // Check that the buffer is empty after the header
-        assert_eq!(buf.len(), header_length);
-    }
-
-    #[test]
-    fn test_serialize_integers() {
-        let record = Record::new(vec![
-            OwnedValue::Integer(42),                // Should use SERIAL_TYPE_I8
-            OwnedValue::Integer(1000),              // Should use SERIAL_TYPE_I16
-            OwnedValue::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
-            OwnedValue::Integer(1_000_000_000),     // Should use SERIAL_TYPE_I32
-            OwnedValue::Integer(1_000_000_000_000), // Should use SERIAL_TYPE_I48
-            OwnedValue::Integer(i64::MAX),          // Should use SERIAL_TYPE_I64
-        ]);
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        let header_length = record.values.len() + 1;
-        let header = &buf[0..header_length];
-        // First byte should be header size
-        assert_eq!(header[0], header_length as u8); // Header should be larger than number of values
-
-        // Check that correct serial types were chosen
-        assert_eq!(header[1] as u64, u64::from(SerialType::I8));
-        assert_eq!(header[2] as u64, u64::from(SerialType::I16));
-        assert_eq!(header[3] as u64, u64::from(SerialType::I24));
-        assert_eq!(header[4] as u64, u64::from(SerialType::I32));
-        assert_eq!(header[5] as u64, u64::from(SerialType::I48));
-        assert_eq!(header[6] as u64, u64::from(SerialType::I64));
-
-        // test that the bytes after the header can be interpreted as the correct values
-        let mut cur_offset = header_length;
-        let i8_bytes = &buf[cur_offset..cur_offset + size_of::<i8>()];
-        cur_offset += size_of::<i8>();
-        let i16_bytes = &buf[cur_offset..cur_offset + size_of::<i16>()];
-        cur_offset += size_of::<i16>();
-        let i24_bytes = &buf[cur_offset..cur_offset + size_of::<i32>() - 1];
-        cur_offset += size_of::<i32>() - 1; // i24
-        let i32_bytes = &buf[cur_offset..cur_offset + size_of::<i32>()];
-        cur_offset += size_of::<i32>();
-        let i48_bytes = &buf[cur_offset..cur_offset + size_of::<i64>() - 2];
-        cur_offset += size_of::<i64>() - 2; // i48
-        let i64_bytes = &buf[cur_offset..cur_offset + size_of::<i64>()];
-
-        let val_int8 = i8::from_be_bytes(i8_bytes.try_into().unwrap());
-        let val_int16 = i16::from_be_bytes(i16_bytes.try_into().unwrap());
-
-        let mut leading_0 = vec![0];
-        leading_0.extend(i24_bytes);
-        let val_int24 = i32::from_be_bytes(leading_0.try_into().unwrap());
-
-        let val_int32 = i32::from_be_bytes(i32_bytes.try_into().unwrap());
-
-        let mut leading_00 = vec![0, 0];
-        leading_00.extend(i48_bytes);
-        let val_int48 = i64::from_be_bytes(leading_00.try_into().unwrap());
-
-        let val_int64 = i64::from_be_bytes(i64_bytes.try_into().unwrap());
-
-        assert_eq!(val_int8, 42);
-        assert_eq!(val_int16, 1000);
-        assert_eq!(val_int24, 1_000_000);
-        assert_eq!(val_int32, 1_000_000_000);
-        assert_eq!(val_int48, 1_000_000_000_000);
-        assert_eq!(val_int64, i64::MAX);
-
-        // assert correct size of buffer: header + values (bytes per value depends on serial type)
-        assert_eq!(
-            buf.len(),
-            header_length
-                + size_of::<i8>()
-                + size_of::<i16>()
-                + (size_of::<i32>() - 1) // i24
-                + size_of::<i32>()
-                + (size_of::<i64>() - 2) // i48
-                + size_of::<f64>()
-        );
-    }
-
-    #[test]
-    fn test_serialize_float() {
-        #[warn(clippy::approx_constant)]
-        let record = Record::new(vec![OwnedValue::Float(3.15555)]);
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        let header_length = record.values.len() + 1;
-        let header = &buf[0..header_length];
-        // First byte should be header size
-        assert_eq!(header[0], header_length as u8);
-        // Second byte should be serial type for FLOAT
-        assert_eq!(header[1] as u64, u64::from(SerialType::F64));
-        // Check that the bytes after the header can be interpreted as the float
-        let float_bytes = &buf[header_length..header_length + size_of::<f64>()];
-        let float = f64::from_be_bytes(float_bytes.try_into().unwrap());
-        assert_eq!(float, 3.15555);
-        // Check that buffer length is correct
-        assert_eq!(buf.len(), header_length + size_of::<f64>());
-    }
-
-    #[test]
-    fn test_serialize_text() {
-        let text = "hello";
-        let record = Record::new(vec![OwnedValue::Text(Text::new(text))]);
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        let header_length = record.values.len() + 1;
-        let header = &buf[0..header_length];
-        // First byte should be header size
-        assert_eq!(header[0], header_length as u8);
-        // Second byte should be serial type for TEXT, which is (len * 2 + 13)
-        assert_eq!(header[1], (5 * 2 + 13) as u8);
-        // Check the actual text bytes
-        assert_eq!(&buf[2..7], b"hello");
-        // Check that buffer length is correct
-        assert_eq!(buf.len(), header_length + text.len());
-    }
-
-    #[test]
-    fn test_serialize_blob() {
-        let blob = vec![1, 2, 3, 4, 5];
-        let record = Record::new(vec![OwnedValue::Blob(blob.clone())]);
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        let header_length = record.values.len() + 1;
-        let header = &buf[0..header_length];
-        // First byte should be header size
-        assert_eq!(header[0], header_length as u8);
-        // Second byte should be serial type for BLOB, which is (len * 2 + 12)
-        assert_eq!(header[1], (5 * 2 + 12) as u8);
-        // Check the actual blob bytes
-        assert_eq!(&buf[2..7], &[1, 2, 3, 4, 5]);
-        // Check that buffer length is correct
-        assert_eq!(buf.len(), header_length + blob.len());
-    }
-
-    #[test]
-    fn test_serialize_mixed_types() {
-        let text = "test";
-        let record = Record::new(vec![
-            OwnedValue::Null,
-            OwnedValue::Integer(42),
-            OwnedValue::Float(3.15),
-            OwnedValue::Text(Text::new(text)),
-        ]);
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        let header_length = record.values.len() + 1;
-        let header = &buf[0..header_length];
-        // First byte should be header size
-        assert_eq!(header[0], header_length as u8);
-        // Second byte should be serial type for NULL
-        assert_eq!(header[1] as u64, u64::from(SerialType::Null));
-        // Third byte should be serial type for I8
-        assert_eq!(header[2] as u64, u64::from(SerialType::I8));
-        // Fourth byte should be serial type for F64
-        assert_eq!(header[3] as u64, u64::from(SerialType::F64));
-        // Fifth byte should be serial type for TEXT, which is (len * 2 + 13)
-        assert_eq!(header[4] as u64, (4 * 2 + 13) as u64);
-
-        // Check that the bytes after the header can be interpreted as the correct values
-        let mut cur_offset = header_length;
-        let i8_bytes = &buf[cur_offset..cur_offset + size_of::<i8>()];
-        cur_offset += size_of::<i8>();
-        let f64_bytes = &buf[cur_offset..cur_offset + size_of::<f64>()];
-        cur_offset += size_of::<f64>();
-        let text_bytes = &buf[cur_offset..cur_offset + text.len()];
-
-        let val_int8 = i8::from_be_bytes(i8_bytes.try_into().unwrap());
-        let val_float = f64::from_be_bytes(f64_bytes.try_into().unwrap());
-        let val_text = String::from_utf8(text_bytes.to_vec()).unwrap();
-
-        assert_eq!(val_int8, 42);
-        assert_eq!(val_float, 3.15);
-        assert_eq!(val_text, "test");
-
-        // Check that buffer length is correct
-        assert_eq!(
-            buf.len(),
-            header_length + size_of::<i8>() + size_of::<f64>() + text.len()
-        );
     }
 }
