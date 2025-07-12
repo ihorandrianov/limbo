@@ -9,6 +9,8 @@ use tracing::{instrument, Level};
 use turso_core::{CompletionType, File, Result};
 
 use crate::model::FAULT_ERROR_MSG;
+use crate::runner::io::SimulatorIO;
+
 pub(crate) struct SimulatorFile {
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
@@ -38,6 +40,9 @@ pub(crate) struct SimulatorFile {
     pub latency_probability: usize,
 
     pub sync_completion: RefCell<Option<Arc<turso_core::Completion>>>,
+    
+    /// Reference to the parent IO for run_once bug mode
+    pub(crate) io_ref: *const SimulatorIO,
 }
 
 unsafe impl Send for SimulatorFile {}
@@ -46,6 +51,11 @@ unsafe impl Sync for SimulatorFile {}
 impl SimulatorFile {
     pub(crate) fn inject_fault(&self, fault: bool) {
         self.fault.replace(fault);
+    }
+
+    /// Get reference to the parent IO (unsafe but contained within simulator)
+    fn get_io(&self) -> &SimulatorIO {
+        unsafe { &*self.io_ref }
     }
 
     pub(crate) fn stats_table(&self) -> String {
@@ -111,6 +121,14 @@ impl File for SimulatorFile {
         mut c: turso_core::Completion,
     ) -> Result<Arc<turso_core::Completion>> {
         self.nr_pread_calls.set(self.nr_pread_calls.get() + 1);
+        
+        if self.get_io().should_inject_io_callback_drop_fault("pread") {
+            self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                "drop io callback: pread fault".into(),
+            ));
+        }
+        
         if self.fault.get() {
             tracing::debug!("pread fault");
             self.nr_pread_faults.set(self.nr_pread_faults.get() + 1);
@@ -146,6 +164,14 @@ impl File for SimulatorFile {
         mut c: turso_core::Completion,
     ) -> Result<Arc<turso_core::Completion>> {
         self.nr_pwrite_calls.set(self.nr_pwrite_calls.get() + 1);
+        
+        if self.get_io().should_inject_io_callback_drop_fault("pwrite") {
+            self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                "drop io callback: pwrite fault".into(),
+            ));
+        }
+        
         if self.fault.get() {
             tracing::debug!("pwrite fault");
             self.nr_pwrite_faults.set(self.nr_pwrite_faults.get() + 1);
@@ -176,6 +202,14 @@ impl File for SimulatorFile {
 
     fn sync(&self, mut c: turso_core::Completion) -> Result<Arc<turso_core::Completion>> {
         self.nr_sync_calls.set(self.nr_sync_calls.get() + 1);
+        
+        if self.get_io().should_inject_io_callback_drop_fault("sync") {
+            self.nr_sync_faults.set(self.nr_sync_faults.get() + 1);
+            return Err(turso_core::LimboError::InternalError(
+                "drop io callback: sync fault".into(),
+            ));
+        }
+        
         if self.fault.get() {
             tracing::debug!("sync fault");
             self.nr_sync_faults.set(self.nr_sync_faults.get() + 1);

@@ -371,6 +371,9 @@ fn execute_interaction_rusqlite(
         Interaction::FaultyQuery(_) => {
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
         }
+        Interaction::IOCallbackDropTrigger(_) => {
+            unimplemented!("cannot implement IO callback drop trigger in rusqlite, as we do not control IO");
+        }
     }
 
     Ok(ExecutionContinuation::NextInteraction)

@@ -18,6 +18,11 @@ pub(crate) struct SimulatorIO {
     pub(crate) page_size: usize,
     seed: u64,
     latency_probability: usize,
+    
+    pub(crate) io_callback_drop_mode: Cell<bool>,
+    pub(crate) operation_count: Cell<usize>,
+    pub(crate) fail_after_operations: Cell<usize>,
+    pub(crate) pending_operations: RefCell<Vec<String>>,
 }
 
 unsafe impl Send for SimulatorIO {}
@@ -39,6 +44,10 @@ impl SimulatorIO {
             page_size,
             seed,
             latency_probability,
+            io_callback_drop_mode: Cell::new(false),
+            operation_count: Cell::new(0),
+            fail_after_operations: Cell::new(2), // Default: fail after 2 operations
+            pending_operations: RefCell::new(Vec::new()),
         })
     }
 
@@ -49,8 +58,56 @@ impl SimulatorIO {
         }
     }
 
+    /// Enable IO callback drop bug reproduction mode
+    pub(crate) fn enable_io_callback_drop_mode(&self, fail_after: usize) {
+        self.io_callback_drop_mode.set(true);
+        self.fail_after_operations.set(fail_after);
+        self.operation_count.set(0);
+        self.pending_operations.borrow_mut().clear();
+        tracing::info!("Enabled IO callback drop mode: will fail after {} operations", fail_after);
+    }
+
+
+    pub(crate) fn disable_io_callback_drop_mode(&self) {
+        self.io_callback_drop_mode.set(false);
+        tracing::info!("Disabled IO callback drop mode");
+    }
+
+
+    pub(crate) fn should_inject_io_callback_drop_fault(&self, operation: &str) -> bool {
+        if !self.io_callback_drop_mode.get() {
+            return false;
+        }
+
+        let count = self.operation_count.get();
+        self.operation_count.set(count + 1);
+        
+        self.pending_operations.borrow_mut().push(format!("{}_{}", operation, count));
+        
+        let should_fail = count >= self.fail_after_operations.get();
+        
+        if should_fail {
+            tracing::warn!(
+                "Injecting fault for run_once bug reproduction: operation {} ({}), count: {}, pending: {:?}",
+                operation, count, count, self.pending_operations.borrow()
+            );
+        } else {
+            tracing::debug!(
+                "Operation {} ({}) proceeding normally, count: {}, pending: {:?}",
+                operation, count, count, self.pending_operations.borrow()
+            );
+        }
+        
+        should_fail
+    }
+
     pub(crate) fn print_stats(&self) {
         tracing::info!("run_once faults: {}", self.nr_run_once_faults.get());
+        if self.io_callback_drop_mode.get() {
+            tracing::info!("IO callback drop mode: enabled, operation_count: {}, fail_after: {}", 
+                          self.operation_count.get(), self.fail_after_operations.get());
+            tracing::info!("pending operations: {:?}", self.pending_operations.borrow());
+        }
         for file in self.files.borrow().iter() {
             tracing::info!("\n===========================\n{}", file.stats_table());
         }
@@ -87,6 +144,7 @@ impl IO for SimulatorIO {
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(self.seed)),
             latency_probability: self.latency_probability,
             sync_completion: RefCell::new(None),
+            io_ref: self as *const SimulatorIO,
         });
         self.files.borrow_mut().push(file.clone());
         Ok(file)

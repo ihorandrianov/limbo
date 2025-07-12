@@ -241,6 +241,20 @@ pub(crate) fn execute_interaction(
             env.io.inject_fault(false);
             limbo_integrity_check(&conn)?;
         }
+         Interaction::IOCallbackDropTrigger(_) => {
+            let conn = match &env.connections[connection_index] {
+                SimConnection::LimboConnection(conn) => conn.clone(),
+                SimConnection::SQLiteConnection(_) => unreachable!(),
+                SimConnection::Disconnected => unreachable!(),
+            };
+
+            let results = interaction.execute_io_callback_drop_trigger(&conn, env);
+            tracing::debug!(?results);
+            stack.push(results);
+            // Reset fault injection after the IO callback drop trigger
+            env.io.disable_io_callback_drop_mode();
+            limbo_integrity_check(&conn)?;
+        }
     }
 
     Ok(ExecutionContinuation::NextInteraction)

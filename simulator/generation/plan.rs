@@ -191,6 +191,9 @@ impl Display for InteractionPlan {
                             Interaction::FaultyQuery(query) => {
                                 writeln!(f, "{}; --FAULTY QUERY", query)?
                             }
+                            Interaction::IOCallbackDropTrigger(query) => {
+                                writeln!(f, "{}; --IO_CALLBACK_DROP_TRIGGER", query)?
+                            }
                         }
                     }
                     writeln!(f, "-- end testing '{}'", name)?;
@@ -251,6 +254,9 @@ pub(crate) enum Interaction {
     /// close all connections and reopen the database and assert that no data was lost
     FsyncQuery(Query),
     FaultyQuery(Query),
+    /// Specifically designed to trigger the run_once bug by performing multiple operations
+    /// that will generate multiple IO events, with fault injection enabled
+    IOCallbackDropTrigger(Query),
 }
 
 impl Display for Interaction {
@@ -262,6 +268,7 @@ impl Display for Interaction {
             Self::Fault(fault) => write!(f, "FAULT '{}'", fault),
             Self::FsyncQuery(query) => write!(f, "{}", query),
             Self::FaultyQuery(query) => write!(f, "{} -- FAULTY QUERY", query),
+            Self::IOCallbackDropTrigger(query) => write!(f, "{} -- IO_CALLBACK_DROP_TRIGGER", query),
         }
     }
 }
@@ -289,6 +296,8 @@ impl Debug for Assertion {
 pub(crate) enum Fault {
     Disconnect,
     ReopenDatabase,
+    // Fail after N operations
+    IOCallbackDrop(usize), 
 }
 
 impl Display for Fault {
@@ -296,6 +305,7 @@ impl Display for Fault {
         match self {
             Fault::Disconnect => write!(f, "DISCONNECT"),
             Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
+            Fault::IOCallbackDrop(_) => write!(f, "IO_CALLBACK_DROP"),
         }
     }
 }
@@ -406,7 +416,7 @@ impl Interaction {
                 first.extend(query.shadow(env));
                 first
             }
-            Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) | Self::FaultyQuery(_) => {
+            Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) | Self::FaultyQuery(_) | Self::IOCallbackDropTrigger(_) => {
                 vec![]
             }
         }
@@ -522,6 +532,11 @@ impl Interaction {
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
+                    }
+                    Fault::IOCallbackDrop(fail_after) => {
+                        // Enable IO callback drop bug mode in the IO layer
+                        env.io.enable_io_callback_drop_mode(*fail_after);
+                        tracing::info!("Enabled IO callback drop mode: will fail after {} operations", fail_after);
                     }
                 }
                 Ok(())
@@ -655,6 +670,67 @@ impl Interaction {
             unreachable!("unexpected: this function should only be called on queries")
         }
     }
+
+    pub(crate) fn execute_io_callback_drop_trigger(
+        &self,
+        conn: &Arc<Connection>,
+        _env: &mut SimulatorEnv,
+    ) -> ResultSet {
+        if let Self::IOCallbackDropTrigger(query) = self {
+            let query_str = query.to_string();
+            tracing::info!("Executing IO callback drop trigger query: {}", query_str);
+            
+            let rows = conn.query(&query_str);
+            if rows.is_err() {
+                let err = rows.err();
+                tracing::debug!(
+                    "Error running run_once bug trigger query '{}': {:?}",
+                    &query_str[0..query_str.len().min(4096)],
+                    err
+                );
+                return Err(err.unwrap());
+            }
+            let mut rows = rows.unwrap().unwrap();
+            let mut out = Vec::new();
+            
+            while let Ok(row) = rows.step() {
+                match row {
+                    StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        let mut r = Vec::new();
+                        for v in row.get_values() {
+                            let v = v.into();
+                            r.push(v);
+                        }
+                        out.push(r);
+                    }
+                    StepResult::IO => {
+                        // This is where the bug should manifest
+                        // Multiple IO operations might be pending, and one will fail
+                        match rows.run_once() {
+                            Ok(_) => {
+                                tracing::debug!("run_once succeeded in bug trigger mode");
+                            }
+                            Err(e) => {
+                                tracing::warn!("run_once failed in bug trigger mode: {:?}", e);
+                                // The bug is that other pending operations are dropped
+                                // Continue to see if we can detect the issue
+                                break;
+                            }
+                        }
+                    }
+                    StepResult::Done => {
+                        break;
+                    }
+                    StepResult::Interrupt | StepResult::Busy => {}
+                }
+            }
+
+            Ok(out)
+        } else {
+            unreachable!("unexpected: this function should only be called on IOCallbackDropTrigger")
+        }
+    }
 }
 
 fn reopen_database(env: &mut SimulatorEnv) {
@@ -722,11 +798,14 @@ fn random_create_index<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Option<
 }
 
 fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
-    let faults = if env.opts.disable_reopen_database {
+    let mut faults = if env.opts.disable_reopen_database {
         vec![Fault::Disconnect]
     } else {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
     };
+    
+    faults.push(Fault::IOCallbackDrop(rng.gen_range(1..=5)));
+    
     let fault = faults[rng.gen_range(0..faults.len())].clone();
     Interactions::Fault(fault)
 }
